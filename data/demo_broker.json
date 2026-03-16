@@ -1,0 +1,41 @@
+{
+  "cash": 73119.99,
+  "tick": 1,
+  "positions": {
+    "WBD": {
+      "qty": 1398,
+      "avg_entry_price": 6.3664
+    },
+    "OPEN": {
+      "qty": 1118,
+      "avg_entry_price": 7.8544
+    },
+    "VALE": {
+      "qty": 1346,
+      "avg_entry_price": 6.834
+    }
+  },
+  "orders": [
+    {
+      "symbol": "WBD",
+      "side": "buy",
+      "qty": 1398,
+      "price": 6.3664,
+      "timestamp": 1773630435.6764216
+    },
+    {
+      "symbol": "OPEN",
+      "side": "buy",
+      "qty": 1118,
+      "price": 7.8544,
+      "timestamp": 1773630435.6799638
+    },
+    {
+      "symbol": "VALE",
+      "side": "buy",
+      "qty": 1346,
+      "price": 6.834,
+      "timestamp": 1773630435.6824439
+    }
+  ]
+}

@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TradeBot MCP Dashboard</title>
+  <style>
+    body { font-family: Arial, sans-serif; background: #0b1020; color: #edf1f7; margin: 0; }
+    .wrap { max-width: 1240px; margin: 0 auto; padding: 24px; }
+    .row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 20px; }
+    .card { background: #151d36; border-radius: 16px; padding: 18px; box-shadow: 0 12px 30px rgba(0,0,0,.25); }
+    h1, h2 { margin-top: 0; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid rgba(255,255,255,.08); vertical-align: top; }
+    .grid-2 { display: grid; grid-template-columns: 1.4fr 1fr; gap: 16px; margin-bottom: 20px; }
+    .muted { color: #9fb0cf; }
+    .buy { color: #7ef29a; font-weight: bold; }
+    .watch { color: #ffd166; font-weight: bold; }
+    .pill { display: inline-block; padding: 4px 9px; border-radius: 999px; background: #273556; margin-right: 6px; margin-bottom: 6px; }
+    form { display: inline-block; margin-right: 10px; }
+    button { background: #5b8cff; color: white; border: 0; border-radius: 10px; padding: 10px 14px; cursor: pointer; font-weight: bold; }
+    button:hover { opacity: 0.92; }
+    .section { margin-bottom: 20px; }
+    @media (max-width: 980px) {
+      .row, .grid-2 { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <h1>TradeBot MCP Dashboard</h1>
+  <p class="muted">Mode: {{ mode }} | Provider: {{ provider }} | Tiny chaos machine version for low-priced equities.</p>
+
+  <div class="section">
+    <form method="post" action="/scan"><button>Run Scan</button></form>
+    <form method="post" action="/trade-once"><button>Trade Once</button></form>
+  </div>
+
+  <div class="row">
+    <div class="card"><div class="muted">Cash</div><h2>${{ '%.2f'|format(account.cash) }}</h2></div>
+    <div class="card"><div class="muted">Equity</div><h2>${{ '%.2f'|format(account.equity) }}</h2></div>
+    <div class="card"><div class="muted">Buying Power</div><h2>${{ '%.2f'|format(account.buying_power) }}</h2></div>
+    <div class="card"><div class="muted">Open Positions</div><h2>{{ positions|length }}</h2></div>
+  </div>
+
+  <div class="grid-2">
+    <div class="card">
+      <h2>Scan picks</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Symbol</th><th>Action</th><th>Score</th><th>Price</th><th>R/R</th><th>Qty</th><th>Why</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for c in candidates %}
+          <tr>
+            <td>{{ c.symbol }}</td>
+            <td class="{{ c.action }}">{{ c.action }}</td>
+            <td>{{ '%.2f'|format(c.final_score) }}</td>
+            <td>${{ '%.2f'|format(c.price) }}</td>
+            <td>{{ '%.2f'|format(c.reward_risk) }}</td>
+            <td>{{ c.qty }}</td>
+            <td>{% for r in c.reasons %}<span class="pill">{{ r }}</span>{% endfor %}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="7" class="muted">No scan results yet. Hit Run Scan and let the little goblin think.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Learning weights</h2>
+      <table>
+        <thead><tr><th>Strategy</th><th>Weight</th><th>Wins</th><th>Losses</th><th>Total Return</th></tr></thead>
+        <tbody>
+          {% for strategy, item in learning.items() %}
+          <tr>
+            <td>{{ strategy }}</td>
+            <td>{{ '%.2f'|format(item.weight) }}</td>
+            <td>{{ item.wins }}</td>
+            <td>{{ item.losses }}</td>
+            <td>{{ '%.2f'|format(item.total_return) }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="grid-2">
+    <div class="card">
+      <h2>Open positions</h2>
+      <table>
+        <thead><tr><th>Symbol</th><th>Qty</th><th>Entry</th><th>Current</th><th>Market Value</th><th>Unrealized %</th></tr></thead>
+        <tbody>
+          {% for p in positions %}
+          <tr>
+            <td>{{ p.symbol }}</td>
+            <td>{{ p.qty }}</td>
+            <td>${{ '%.2f'|format(p.avg_entry_price) }}</td>
+            <td>${{ '%.2f'|format(p.current_price) }}</td>
+            <td>${{ '%.2f'|format(p.market_value) }}</td>
+            <td>{{ '%.2f'|format(p.unrealized_pl_pct) }}%</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="6" class="muted">No open positions yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Recent trades</h2>
+      <table>
+        <thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Price</th><th>Status</th><th>PNL %</th></tr></thead>
+        <tbody>
+          {% for t in trades %}
+          <tr>
+            <td>{{ t.created_at[:19].replace('T', ' ') }}</td>
+            <td>{{ t.symbol }}</td>
+            <td>{{ t.side }}</td>
+            <td>{{ t.qty }}</td>
+            <td>${{ '%.2f'|format(t.price) }}</td>
+            <td>{{ t.status }}</td>
+            <td>{% if t.pnl_pct is not none %}{{ '%.2f'|format(t.pnl_pct) }}%{% endif %}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="7" class="muted">No trades yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+</body>
+</html>
