@@ -68,6 +68,27 @@ Open:
 http://127.0.0.1:8008
 ```
 
+## Git helper script
+
+Use the included script to stage, commit, and push in one step.
+
+### Windows
+
+```bat
+push_git.bat "your commit message"
+```
+
+### Linux / macOS
+
+```bash
+./push_git.sh "your commit message"
+```
+
+Optional arguments:
+
+- second argument: branch name, defaults to the current branch
+- third argument: remote name, defaults to `origin`
+
 ## Notes
 
 - `trade-once` advances the demo market one step, checks exits, scans again, and buys fresh candidates.
