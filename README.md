@@ -42,6 +42,8 @@ ALPACA_SECRET_KEY=...
 
 ## Quick start
 
+Copy `.env.example` to `.env` and edit your local values there. Keep `.env` out of Git; commit only template changes to `.env.example`.
+
 ### Linux / macOS
 
 ```bash
@@ -67,6 +69,12 @@ Open:
 ```text
 http://127.0.0.1:8008
 ```
+
+## Environment variables
+
+The app reads its active settings from `tradebot/config.py`. Use `.env.example` as the shareable template and `.env` for machine-local secrets such as Alpaca credentials.
+
+If you add a new key to `.env`, it will only affect runtime after the setting is also wired into `tradebot/config.py` and the code that uses it.
 
 ## Git helper script
 
