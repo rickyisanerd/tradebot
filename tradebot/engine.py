@@ -42,7 +42,9 @@ class TradingEngine:
             + risk_score * weights["risk"]
         ) / total_weight
 
-        stop_price = round(max(price - (metrics["atr"] * 1.6), price * 0.88, self.settings.min_stock_price * 0.5), 2)
+        stop_from_atr = price - (metrics["atr"] * 1.6)
+        stop_from_pct = price * (1 - self.settings.stop_loss_pct)
+        stop_price = round(max(stop_from_atr, stop_from_pct, self.settings.min_stock_price * 0.5), 2)
         target_from_swing = max(metrics["swing_high20"] * 1.02, price + metrics["atr"] * 2.4)
         target_price = round(target_from_swing, 2)
         reward = max(0.01, target_price - price)
@@ -109,6 +111,8 @@ class TradingEngine:
         return trimmed
 
     def manage_positions(self) -> List[dict]:
+        if self.settings.is_alpaca and self.settings.use_broker_protective_orders:
+            return []
         prices = self.broker.latest_prices([p.symbol for p in self.broker.positions()])
         sold: List[dict] = []
         for position in self.broker.positions():
@@ -158,7 +162,12 @@ class TradingEngine:
             if candidate.qty <= 0 or est_cost > cash_left:
                 continue
             try:
-                result = self.broker.buy(candidate.symbol, candidate.qty)
+                result = self.broker.buy(
+                    candidate.symbol,
+                    candidate.qty,
+                    stop_price=candidate.stop_price,
+                    target_price=candidate.target_price,
+                )
             except ProviderError as exc:
                 self.db.record_trade(candidate.symbol, "buy", candidate.qty, candidate.price, "error", str(exc), analysis=candidate.analyst_scores)
                 continue

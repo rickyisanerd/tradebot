@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -6,7 +7,8 @@ from tradebot.config import Settings
 from tradebot.dashboard import create_app
 from tradebot.db import Database
 from tradebot.engine import TradingEngine
-from tradebot.providers import build_broker
+from tradebot.models import AccountSnapshot, Candidate
+from tradebot.providers import AlpacaBroker, BaseBroker, build_broker
 
 
 def make_settings(tmp_path: Path) -> Settings:
@@ -35,3 +37,134 @@ def test_dashboard_renders(tmp_path: Path):
     response = client.get("/")
     assert response.status_code == 200
     assert "TradeBot MCP Dashboard" in response.text
+
+
+def test_manage_positions_sells_when_stop_hit(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    engine = TradingEngine(settings=settings, broker=build_broker(settings), db=Database(settings.db_path))
+
+    first = engine.trade_once()
+    assert first["bought"]
+
+    symbol = first["bought"][0]["symbol"]
+    meta = engine.db.get_position_meta(symbol)
+    assert meta is not None
+
+    # Raise the stored stop above the market so the next management pass must exit.
+    engine.db.open_position_meta(
+        symbol,
+        float(meta["qty"]),
+        float(meta["entry_price"]),
+        float(meta["entry_price"]) * 10,
+        float(meta["target_price"]),
+        meta["analysis"],
+    )
+
+    sold = engine.manage_positions()
+    assert sold
+    assert sold[0]["symbol"] == symbol
+    assert sold[0]["note"] == "stop hit"
+    assert engine.broker.positions() == []
+
+
+def test_settings_reads_stop_loss_from_env(tmp_path: Path):
+    previous = os.environ.get("STOP_LOSS")
+    os.environ["STOP_LOSS"] = "5"
+    try:
+        settings = Settings(data_dir=tmp_path)
+    finally:
+        if previous is None:
+            os.environ.pop("STOP_LOSS", None)
+        else:
+            os.environ["STOP_LOSS"] = previous
+    assert settings.stop_loss_pct == 0.05
+
+
+class CaptureAlpacaBroker(AlpacaBroker):
+    def __init__(self, settings: Settings) -> None:
+        self.calls = []
+        super().__init__(settings)
+
+    def _request(self, method: str, url: str, **kwargs):
+        self.calls.append((method, url, kwargs))
+        return {"status": "accepted"}
+
+
+def test_alpaca_buy_uses_bracket_order_payload(tmp_path: Path):
+    settings = Settings(data_dir=tmp_path)
+    settings.broker_mode = "paper"
+    settings.alpaca_key_id = "key"
+    settings.alpaca_secret_key = "secret"
+    settings.use_broker_protective_orders = True
+    settings.__post_init__()
+
+    broker = CaptureAlpacaBroker(settings)
+    broker.buy("AAPL", 3, stop_price=9.5, target_price=11.25)
+
+    method, url, kwargs = broker.calls[-1]
+    payload = kwargs["json"]
+    assert method == "POST"
+    assert url.endswith("/v2/orders")
+    assert payload["symbol"] == "AAPL"
+    assert payload["qty"] == 3
+    assert payload["order_class"] == "bracket"
+    assert payload["stop_loss"] == {"stop_price": 9.5}
+    assert payload["take_profit"] == {"limit_price": 11.25}
+
+
+class CaptureBroker(BaseBroker):
+    name = "capture"
+
+    def __init__(self, settings: Settings) -> None:
+        super().__init__(settings)
+        self.last_buy = None
+
+    def account(self) -> AccountSnapshot:
+        return AccountSnapshot(cash=1_000, equity=1_000, buying_power=1_000, mode=self.settings.broker_mode)
+
+    def positions(self):
+        return []
+
+    def bars(self, symbols, days):
+        return {}
+
+    def latest_prices(self, symbols):
+        return {}
+
+    def buy(self, symbol: str, qty: int, stop_price=None, target_price=None) -> dict:
+        self.last_buy = {
+            "symbol": symbol,
+            "qty": qty,
+            "stop_price": stop_price,
+            "target_price": target_price,
+        }
+        return {"symbol": symbol, "qty": qty, "filled_avg_price": 10.0, "status": "filled"}
+
+    def sell(self, symbol: str, qty=None) -> dict:
+        return {"symbol": symbol, "qty": qty or 0, "filled_avg_price": 10.0, "status": "filled"}
+
+
+def test_buy_candidates_passes_stop_and_target_to_broker(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    broker = CaptureBroker(settings)
+    engine = TradingEngine(settings=settings, broker=broker, db=Database(settings.db_path))
+    candidate = Candidate(
+        symbol="AAPL",
+        price=10.0,
+        final_score=90.0,
+        action="buy",
+        stop_price=9.5,
+        target_price=11.5,
+        reward_risk=2.0,
+        qty=2,
+    )
+
+    result = engine.buy_candidates([candidate])
+
+    assert result
+    assert broker.last_buy == {
+        "symbol": "AAPL",
+        "qty": 2,
+        "stop_price": 9.5,
+        "target_price": 11.5,
+    }

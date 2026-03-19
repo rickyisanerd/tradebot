@@ -29,6 +29,8 @@ Set:
 BROKER_MODE=paper
 ALPACA_KEY_ID=...
 ALPACA_SECRET_KEY=...
+STOP_LOSS=5
+USE_BROKER_PROTECTIVE_ORDERS=true
 ```
 
 ### 3) Alpaca live mode
@@ -38,6 +40,8 @@ Set:
 BROKER_MODE=live
 ALPACA_KEY_ID=...
 ALPACA_SECRET_KEY=...
+STOP_LOSS=5
+USE_BROKER_PROTECTIVE_ORDERS=true
 ```
 
 ## Quick start
@@ -75,6 +79,8 @@ http://127.0.0.1:8008
 The app reads its active settings from `tradebot/config.py`. Use `.env.example` as the shareable template and `.env` for machine-local secrets such as Alpaca credentials.
 
 If you add a new key to `.env`, it will only affect runtime after the setting is also wired into `tradebot/config.py` and the code that uses it.
+
+`STOP_LOSS` (or `STOP_LOSS_PCT`) now controls the stop distance used when the bot computes exits. In Alpaca paper/live mode, `USE_BROKER_PROTECTIVE_ORDERS=true` submits bracket entry orders so Alpaca can hold the stop-loss and take-profit legs at the broker.
 
 ## Git helper script
 

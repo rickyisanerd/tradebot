@@ -42,7 +42,7 @@ class BaseBroker:
     def latest_prices(self, symbols: List[str]) -> Dict[str, float]:
         raise NotImplementedError
 
-    def buy(self, symbol: str, qty: int) -> dict:
+    def buy(self, symbol: str, qty: int, stop_price: Optional[float] = None, target_price: Optional[float] = None) -> dict:
         raise NotImplementedError
 
     def sell(self, symbol: str, qty: Optional[float] = None) -> dict:
@@ -158,7 +158,7 @@ class DemoBroker(BaseBroker):
             )
         return sorted(positions, key=lambda x: x.market_value, reverse=True)
 
-    def buy(self, symbol: str, qty: int) -> dict:
+    def buy(self, symbol: str, qty: int, stop_price: Optional[float] = None, target_price: Optional[float] = None) -> dict:
         if qty <= 0:
             raise ProviderError("Quantity must be positive.")
         state = self._load()
@@ -290,7 +290,7 @@ class AlpacaBroker(BaseBroker):
                 prices[symbol] = float(price)
         return prices
 
-    def buy(self, symbol: str, qty: int) -> dict:
+    def buy(self, symbol: str, qty: int, stop_price: Optional[float] = None, target_price: Optional[float] = None) -> dict:
         order = {
             "symbol": symbol,
             "qty": qty,
@@ -298,6 +298,15 @@ class AlpacaBroker(BaseBroker):
             "type": "market",
             "time_in_force": "day",
         }
+        if (
+            self.settings.use_broker_protective_orders
+            and stop_price is not None
+            and target_price is not None
+            and target_price > stop_price
+        ):
+            order["order_class"] = "bracket"
+            order["take_profit"] = {"limit_price": round(float(target_price), 2)}
+            order["stop_loss"] = {"stop_price": round(float(stop_price), 2)}
         return self._request("POST", f"{self.settings.trading_base_url}/v2/orders", json=order)
 
     def sell(self, symbol: str, qty: Optional[float] = None) -> dict:

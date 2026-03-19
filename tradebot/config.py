@@ -12,12 +12,31 @@ from .universe import DEFAULT_UNIVERSE
 load_dotenv()
 
 
+def _env_ratio(*names: str, default: float) -> float:
+    for name in names:
+        raw = os.getenv(name)
+        if raw is None or not raw.strip():
+            continue
+        value = float(raw)
+        return value / 100.0 if value > 1 else value
+    return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
 @dataclass
 class Settings:
     app_name: str = "TradeBot MCP"
     broker_mode: str = field(default_factory=lambda: os.getenv("BROKER_MODE", "demo").lower())
     alpaca_key_id: str = field(default_factory=lambda: os.getenv("ALPACA_KEY_ID", ""))
     alpaca_secret_key: str = field(default_factory=lambda: os.getenv("ALPACA_SECRET_KEY", ""))
+    stop_loss_pct: float = field(default_factory=lambda: _env_ratio("STOP_LOSS_PCT", "STOP_LOSS", default=0.12))
+    use_broker_protective_orders: bool = field(default_factory=lambda: _env_bool("USE_BROKER_PROTECTIVE_ORDERS", True))
     max_stock_price: float = field(default_factory=lambda: float(os.getenv("MAX_STOCK_PRICE", "20")))
     min_stock_price: float = field(default_factory=lambda: float(os.getenv("MIN_STOCK_PRICE", "2")))
     scan_limit: int = field(default_factory=lambda: int(os.getenv("SCAN_LIMIT", "40")))
