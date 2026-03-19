@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Dict, List
 
 from .analytics import compute_metrics
@@ -110,21 +111,43 @@ class TradingEngine:
         self.db.record_scan(self.settings.broker_mode, self.broker.name, [c.model_dump() for c in trimmed])
         return trimmed
 
-    def reconcile_broker_managed_exits(self) -> List[dict]:
-        tracked = self.db.all_position_meta()
-        if not tracked:
-            return []
+    def _held_days(self, opened_at: str) -> int:
+        opened = datetime.fromisoformat(opened_at)
+        if opened.tzinfo is None:
+            opened = opened.replace(tzinfo=timezone.utc)
+        return max(0, (datetime.now(timezone.utc) - opened).days)
+
+    def reconcile_broker_state(self) -> List[dict]:
+        tracked = {item["symbol"]: item for item in self.db.all_position_meta()}
         live_positions = {p.symbol: p for p in self.broker.positions()}
-        missing_symbols = [item["symbol"] for item in tracked if item["symbol"] not in live_positions]
+        notes: List[dict] = []
+
+        for symbol, position in live_positions.items():
+            meta = tracked.get(symbol)
+            if not meta:
+                stop_price = round(max(position.avg_entry_price * (1 - self.settings.stop_loss_pct), self.settings.min_stock_price * 0.5), 2)
+                target_price = round(position.avg_entry_price + (position.avg_entry_price - stop_price) * self.settings.min_reward_risk, 2)
+                self.db.open_position_meta(symbol, position.qty, position.avg_entry_price, stop_price, target_price, {})
+                self.db.record_trade(symbol, "buy", position.qty, position.avg_entry_price, "reconciled", "reconciled external position")
+                notes.append({"symbol": symbol, "note": "reconciled external position"})
+                continue
+            if abs(float(meta["qty"]) - float(position.qty)) > 1e-9 or abs(float(meta["entry_price"]) - float(position.avg_entry_price)) > 1e-9:
+                self.db.open_position_meta(
+                    symbol,
+                    position.qty,
+                    position.avg_entry_price,
+                    float(meta["stop_price"]),
+                    float(meta["target_price"]),
+                    meta["analysis"],
+                )
+                notes.append({"symbol": symbol, "note": "synced live position metadata"})
+
+        missing_symbols = [symbol for symbol in tracked if symbol not in live_positions]
         if not missing_symbols:
-            return []
+            return notes
 
         recent_sells = self.broker.recent_filled_sell_orders(missing_symbols)
-        reconciled: List[dict] = []
-        for item in tracked:
-            symbol = item["symbol"]
-            if symbol in live_positions:
-                continue
+        for symbol in missing_symbols:
             order = recent_sells.get(symbol)
             if not order:
                 continue
@@ -140,14 +163,17 @@ class TradingEngine:
             self.db.record_trade(symbol, "sell", qty, exit_price, order.get("status", "filled"), note, pnl_pct, analysis)
             if analysis:
                 self.db.update_learning(analysis, pnl_pct)
-            reconciled.append({"symbol": symbol, "pnl_pct": round(pnl_pct, 2), "note": note})
-        return reconciled
+            notes.append({"symbol": symbol, "pnl_pct": round(pnl_pct, 2), "note": note})
+        return notes
 
     def manage_positions(self) -> List[dict]:
-        if self.settings.is_alpaca and self.settings.use_broker_protective_orders:
-            return self.reconcile_broker_managed_exits()
+        broker_notes: List[dict] = []
+        if self.settings.is_alpaca:
+            broker_notes = self.reconcile_broker_state()
+            if self.settings.use_broker_protective_orders:
+                return broker_notes
         prices = self.broker.latest_prices([p.symbol for p in self.broker.positions()])
-        sold: List[dict] = []
+        sold: List[dict] = list(broker_notes)
         for position in self.broker.positions():
             meta = self.db.get_position_meta(position.symbol)
             if not meta:
@@ -155,15 +181,19 @@ class TradingEngine:
             current = prices.get(position.symbol, position.current_price)
             should_sell = False
             note = ""
+            held_days = self._held_days(str(meta["opened_at"]))
             if current <= float(meta["stop_price"]):
                 should_sell = True
                 note = "stop hit"
-            elif current >= float(meta["target_price"]):
+            elif self.settings.max_hold_days > 0 and held_days >= self.settings.max_hold_days:
                 should_sell = True
-                note = "target hit"
+                note = "time stop"
             elif position.unrealized_pl_pct <= -6:
                 should_sell = True
                 note = "drawdown cap"
+            elif held_days >= self.settings.min_hold_days and current >= float(meta["target_price"]):
+                should_sell = True
+                note = "target hit"
             if should_sell:
                 try:
                     result = self.broker.sell(position.symbol, position.qty)
@@ -181,34 +211,43 @@ class TradingEngine:
         return sold
 
     def buy_candidates(self, candidates: List[Candidate]) -> List[dict]:
-        existing = {p.symbol for p in self.broker.positions()}
+        positions = self.broker.positions()
+        existing = {p.symbol for p in positions}
         account = self.broker.account()
         bought: List[dict] = []
-        slots = self.settings.max_new_positions_per_run
+        open_position_limit = self.settings.max_open_positions or (len(positions) + self.settings.max_new_positions_per_run)
+        slots = min(self.settings.max_new_positions_per_run, max(0, open_position_limit - len(positions)))
         cash_left = account.buying_power
+        deployed_capital = sum(p.market_value for p in positions)
+        capital_limit = self.settings.max_total_capital if self.settings.max_total_capital > 0 else max(account.equity, deployed_capital + cash_left)
+        capital_left = max(0.0, capital_limit - deployed_capital)
         for candidate in candidates:
             if slots <= 0:
                 break
             if candidate.action != "buy" or candidate.symbol in existing:
                 continue
-            est_cost = candidate.qty * candidate.price
-            if candidate.qty <= 0 or est_cost > cash_left:
+            max_affordable_qty = int(min(cash_left, capital_left) / candidate.price) if candidate.price > 0 else 0
+            qty = min(candidate.qty, max_affordable_qty)
+            est_cost = qty * candidate.price
+            if qty <= 0 or est_cost > cash_left or est_cost > capital_left:
                 continue
             try:
                 result = self.broker.buy(
                     candidate.symbol,
-                    candidate.qty,
+                    qty,
                     stop_price=candidate.stop_price,
                     target_price=candidate.target_price,
                 )
             except ProviderError as exc:
-                self.db.record_trade(candidate.symbol, "buy", candidate.qty, candidate.price, "error", str(exc), analysis=candidate.analyst_scores)
+                self.db.record_trade(candidate.symbol, "buy", qty or candidate.qty, candidate.price, "error", str(exc), analysis=candidate.analyst_scores)
                 continue
             fill_price = float(result.get("filled_avg_price") or candidate.price)
-            self.db.record_trade(candidate.symbol, "buy", float(result.get("qty", candidate.qty)), fill_price, result.get("status", "submitted"), "entry", analysis=candidate.analyst_scores)
-            self.db.open_position_meta(candidate.symbol, float(result.get("qty", candidate.qty)), fill_price, candidate.stop_price, candidate.target_price, candidate.analyst_scores)
-            bought.append({"symbol": candidate.symbol, "qty": candidate.qty, "price": fill_price})
+            filled_qty = float(result.get("qty", qty))
+            self.db.record_trade(candidate.symbol, "buy", filled_qty, fill_price, result.get("status", "submitted"), "entry", analysis=candidate.analyst_scores)
+            self.db.open_position_meta(candidate.symbol, filled_qty, fill_price, candidate.stop_price, candidate.target_price, candidate.analyst_scores)
+            bought.append({"symbol": candidate.symbol, "qty": filled_qty, "price": fill_price})
             cash_left -= est_cost
+            capital_left -= est_cost
             slots -= 1
         return bought
 

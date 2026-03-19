@@ -31,6 +31,9 @@ ALPACA_KEY_ID=...
 ALPACA_SECRET_KEY=...
 STOP_LOSS=5
 USE_BROKER_PROTECTIVE_ORDERS=true
+MIN_HOLD_DAYS=1
+MAX_TOTAL_CAPITAL=5000
+MAX_OPEN_POSITIONS=5
 ```
 
 ### 3) Alpaca live mode
@@ -42,6 +45,9 @@ ALPACA_KEY_ID=...
 ALPACA_SECRET_KEY=...
 STOP_LOSS=5
 USE_BROKER_PROTECTIVE_ORDERS=true
+MIN_HOLD_DAYS=1
+MAX_TOTAL_CAPITAL=5000
+MAX_OPEN_POSITIONS=5
 ```
 
 ## Quick start
@@ -81,6 +87,8 @@ The app reads its active settings from `tradebot/config.py`. Use `.env.example` 
 If you add a new key to `.env`, it will only affect runtime after the setting is also wired into `tradebot/config.py` and the code that uses it.
 
 `STOP_LOSS` (or `STOP_LOSS_PCT`) now controls the stop distance used when the bot computes exits. In Alpaca paper/live mode, `USE_BROKER_PROTECTIVE_ORDERS=true` submits bracket entry orders so Alpaca can hold the stop-loss and take-profit legs at the broker.
+
+`MIN_HOLD_DAYS` prevents routine target exits from firing too early, while `MAX_HOLD_DAYS` can enforce a time stop when set above `0`. `MAX_TOTAL_CAPITAL` and `MAX_OPEN_POSITIONS` cap how much exposure the bot is allowed to carry across the portfolio.
 
 ## Git helper script
 
