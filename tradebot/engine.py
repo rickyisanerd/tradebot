@@ -110,9 +110,42 @@ class TradingEngine:
         self.db.record_scan(self.settings.broker_mode, self.broker.name, [c.model_dump() for c in trimmed])
         return trimmed
 
+    def reconcile_broker_managed_exits(self) -> List[dict]:
+        tracked = self.db.all_position_meta()
+        if not tracked:
+            return []
+        live_positions = {p.symbol: p for p in self.broker.positions()}
+        missing_symbols = [item["symbol"] for item in tracked if item["symbol"] not in live_positions]
+        if not missing_symbols:
+            return []
+
+        recent_sells = self.broker.recent_filled_sell_orders(missing_symbols)
+        reconciled: List[dict] = []
+        for item in tracked:
+            symbol = item["symbol"]
+            if symbol in live_positions:
+                continue
+            order = recent_sells.get(symbol)
+            if not order:
+                continue
+            closed = self.db.close_position_meta(symbol)
+            if not closed:
+                continue
+            exit_price = float(order.get("filled_avg_price") or order.get("limit_price") or closed["target_price"])
+            qty = float(order.get("filled_qty") or order.get("qty") or closed["qty"])
+            entry = float(closed["entry_price"])
+            pnl_pct = ((exit_price - entry) / entry) * 100 if entry else 0.0
+            note = order.get("order_class") or order.get("client_order_id") or "broker managed exit"
+            analysis = closed["analysis"]
+            self.db.record_trade(symbol, "sell", qty, exit_price, order.get("status", "filled"), note, pnl_pct, analysis)
+            if analysis:
+                self.db.update_learning(analysis, pnl_pct)
+            reconciled.append({"symbol": symbol, "pnl_pct": round(pnl_pct, 2), "note": note})
+        return reconciled
+
     def manage_positions(self) -> List[dict]:
         if self.settings.is_alpaca and self.settings.use_broker_protective_orders:
-            return []
+            return self.reconcile_broker_managed_exits()
         prices = self.broker.latest_prices([p.symbol for p in self.broker.positions()])
         sold: List[dict] = []
         for position in self.broker.positions():

@@ -48,6 +48,9 @@ class BaseBroker:
     def sell(self, symbol: str, qty: Optional[float] = None) -> dict:
         raise NotImplementedError
 
+    def recent_filled_sell_orders(self, symbols: List[str]) -> Dict[str, dict]:
+        return {}
+
 
 class DemoBroker(BaseBroker):
     name = "demo"
@@ -119,7 +122,7 @@ class DemoBroker(BaseBroker):
         tick = int(state["tick"])
         out: Dict[str, float] = {}
         for symbol in symbols:
-            out[symbol] = self._bars_for_symbol(symbol, 3, tick)[-1]["c"]
+            out[symbol] = self._bars_for_symbol(symbol, max(30, self.settings.lookback_days), tick)[-1]["c"]
         return out
 
     def account(self) -> AccountSnapshot:
@@ -320,6 +323,32 @@ class AlpacaBroker(BaseBroker):
             "time_in_force": "day",
         }
         return self._request("POST", f"{self.settings.trading_base_url}/v2/orders", json=order)
+
+    def recent_filled_sell_orders(self, symbols: List[str]) -> Dict[str, dict]:
+        if not symbols:
+            return {}
+        payload = self._request(
+            "GET",
+            f"{self.settings.trading_base_url}/v2/orders",
+            params={"status": "closed", "limit": 100, "nested": "true", "direction": "desc"},
+        )
+        symbol_set = set(symbols)
+        matched: Dict[str, dict] = {}
+
+        def visit(order: dict) -> None:
+            symbol = order.get("symbol")
+            if symbol not in symbol_set or order.get("side") != "sell":
+                return
+            if order.get("status") != "filled":
+                return
+            if symbol not in matched:
+                matched[symbol] = order
+
+        for order in payload if isinstance(payload, list) else []:
+            visit(order)
+            for leg in order.get("legs") or []:
+                visit(leg)
+        return matched
 
 
 def build_broker(settings: Settings) -> BaseBroker:

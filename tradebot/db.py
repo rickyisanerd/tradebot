@@ -194,8 +194,12 @@ class Database:
                     continue
                 wins = row["wins"] + (1 if pnl_pct > 0 else 0)
                 losses = row["losses"] + (1 if pnl_pct <= 0 else 0)
-                total_return = row["total_return"] + float(pnl_pct) * (float(score) / 100.0)
-                weight = 1.0 + (wins - losses) * 0.03 + total_return * 0.05
+                # Keep learning responsive to outcome quality without letting one outlier
+                # trade pin every strategy to the floor or ceiling.
+                bounded_pnl = max(-12.0, min(12.0, float(pnl_pct)))
+                contribution = (bounded_pnl / 12.0) * (float(score) / 100.0)
+                total_return = row["total_return"] + contribution
+                weight = 1.0 + (wins - losses) * 0.02 + total_return * 0.18
                 weight = max(0.5, min(1.8, weight))
                 con.execute(
                     """

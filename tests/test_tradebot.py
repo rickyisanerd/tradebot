@@ -68,15 +68,21 @@ def test_manage_positions_sells_when_stop_hit(tmp_path: Path):
 
 
 def test_settings_reads_stop_loss_from_env(tmp_path: Path):
-    previous = os.environ.get("STOP_LOSS")
+    previous_stop_loss = os.environ.get("STOP_LOSS")
+    previous_stop_loss_pct = os.environ.get("STOP_LOSS_PCT")
     os.environ["STOP_LOSS"] = "5"
+    os.environ.pop("STOP_LOSS_PCT", None)
     try:
         settings = Settings(data_dir=tmp_path)
     finally:
-        if previous is None:
+        if previous_stop_loss is None:
             os.environ.pop("STOP_LOSS", None)
         else:
-            os.environ["STOP_LOSS"] = previous
+            os.environ["STOP_LOSS"] = previous_stop_loss
+        if previous_stop_loss_pct is None:
+            os.environ.pop("STOP_LOSS_PCT", None)
+        else:
+            os.environ["STOP_LOSS_PCT"] = previous_stop_loss_pct
     assert settings.stop_loss_pct == 0.05
 
 
@@ -168,3 +174,84 @@ def test_buy_candidates_passes_stop_and_target_to_broker(tmp_path: Path):
         "stop_price": 9.5,
         "target_price": 11.5,
     }
+
+
+class BrokerManagedExitBroker(BaseBroker):
+    name = "broker-managed"
+
+    def __init__(self, settings: Settings) -> None:
+        super().__init__(settings)
+        self._positions = []
+        self._recent = {
+            "AAPL": {
+                "symbol": "AAPL",
+                "side": "sell",
+                "status": "filled",
+                "filled_avg_price": 11.0,
+                "filled_qty": 2,
+                "order_class": "bracket",
+            }
+        }
+
+    def account(self) -> AccountSnapshot:
+        return AccountSnapshot(cash=1_000, equity=1_000, buying_power=1_000, mode=self.settings.broker_mode)
+
+    def positions(self):
+        return self._positions
+
+    def bars(self, symbols, days):
+        return {}
+
+    def latest_prices(self, symbols):
+        return {}
+
+    def buy(self, symbol: str, qty: int, stop_price=None, target_price=None) -> dict:
+        return {"symbol": symbol, "qty": qty, "filled_avg_price": 10.0, "status": "filled"}
+
+    def sell(self, symbol: str, qty=None) -> dict:
+        return {"symbol": symbol, "qty": qty or 0, "filled_avg_price": 10.0, "status": "filled"}
+
+    def recent_filled_sell_orders(self, symbols):
+        return {symbol: self._recent[symbol] for symbol in symbols if symbol in self._recent}
+
+
+def test_reconcile_broker_managed_exits_updates_learning(tmp_path: Path):
+    settings = Settings(data_dir=tmp_path)
+    settings.broker_mode = "paper"
+    settings.use_broker_protective_orders = True
+    settings.alpaca_key_id = "key"
+    settings.alpaca_secret_key = "secret"
+    settings.__post_init__()
+
+    broker = BrokerManagedExitBroker(settings)
+    db = Database(settings.db_path)
+    engine = TradingEngine(settings=settings, broker=broker, db=db)
+    db.open_position_meta("AAPL", 2, 10.0, 9.5, 11.0, {"momentum": 100.0, "reversion": 50.0, "risk": 75.0})
+
+    before = engine.learning_weights()
+    sold = engine.manage_positions()
+    after = engine.learning_weights()
+
+    assert sold == [{"symbol": "AAPL", "pnl_pct": 10.0, "note": "bracket"}]
+    assert after["momentum"] > before["momentum"]
+    assert db.get_position_meta("AAPL") is None
+
+
+def test_demo_latest_price_matches_bar_close(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    broker = build_broker(settings)
+    symbol = broker.universe()[0]
+
+    latest = broker.latest_prices([symbol])[symbol]
+    bars = broker.bars([symbol], settings.lookback_days)[symbol]
+
+    assert latest == bars[-1]["c"]
+
+
+def test_learning_update_caps_single_outlier_loss(tmp_path: Path):
+    db = Database(tmp_path / "tradebot.db")
+
+    db.update_learning({"momentum": 100.0}, -50.0)
+    weights = db.learning_weights()
+
+    assert weights["momentum"]["weight"] > 0.5
