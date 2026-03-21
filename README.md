@@ -88,7 +88,7 @@ This repo now includes [Procfile](c:/Users/ricky/OneDrive/Documents/tradebot_mcp
 
 Recommended Railway setup:
 
-- start command: `python -m tradebot.cli dashboard`
+- start command: `python -m uvicorn main:app --host 0.0.0.0 --port $PORT`
 - health check path: `/health`
 - public port: Railway injects `PORT` automatically, and the app now uses it by default
 - if you want SQLite state to survive redeploys, mount a Railway volume and set `DATA_DIR=/data` (or your chosen mounted path)
