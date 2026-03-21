@@ -3,11 +3,12 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from tradebot.congress import CongressTracker
 from tradebot.config import Settings
-from tradebot.dashboard import create_app
+from tradebot.dashboard import TradingScheduler, create_app
 from tradebot.db import Database
 from tradebot.engine import TradingEngine
-from tradebot.models import AccountSnapshot, Candidate, PositionSnapshot
+from tradebot.models import AccountSnapshot, Candidate, CongressTrade, PositionSnapshot
 from tradebot.providers import AlpacaBroker, BaseBroker, build_broker
 
 
@@ -37,6 +38,144 @@ def test_dashboard_renders(tmp_path: Path):
     response = client.get("/")
     assert response.status_code == 200
     assert "TradeBot MCP Dashboard" in response.text
+
+
+def test_healthcheck_endpoint(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    app = create_app(settings)
+    client = TestClient(app)
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+
+
+def test_api_status_reports_auto_trade_settings(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    settings.auto_trade_enabled = True
+    settings.auto_trade_interval_minutes = 60
+    app = create_app(settings)
+    client = TestClient(app)
+
+    response = client.get("/api/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["auto_trade_enabled"] is True
+    assert payload["auto_trade_interval_minutes"] == 60
+
+
+def test_settings_prefers_port_env_for_deploys(tmp_path: Path):
+    previous_port = os.environ.get("PORT")
+    previous_dashboard_port = os.environ.get("DASHBOARD_PORT")
+    os.environ["PORT"] = "9000"
+    os.environ["DASHBOARD_PORT"] = "8008"
+    try:
+        settings = Settings(data_dir=tmp_path)
+    finally:
+        if previous_port is None:
+            os.environ.pop("PORT", None)
+        else:
+            os.environ["PORT"] = previous_port
+        if previous_dashboard_port is None:
+            os.environ.pop("DASHBOARD_PORT", None)
+        else:
+            os.environ["DASHBOARD_PORT"] = previous_dashboard_port
+
+    assert settings.dashboard_port == 9000
+
+
+def test_trading_scheduler_runs_callback_once() -> None:
+    calls = []
+    scheduler = TradingScheduler(3600, lambda: calls.append("tick"))
+
+    scheduler.run_cycle()
+
+    assert calls == ["tick"]
+
+
+def test_congress_tracker_parses_house_ptr_text(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    tracker = CongressTracker(settings, lambda symbols: {symbol: 12.5 for symbol in symbols})
+    text = """
+    Name: Hon. Example Member
+    SoundHound AI, Inc. Class A Common Stock (SOUN) [ST] P 02/10/2026 02/25/2026 $1,001 - $15,000
+    Apple Inc. - Common Stock (AAPL) [ST] S 02/10/2026 02/25/2026 $1,001 - $15,000
+    """
+
+    trades = tracker.parse_ptr_text(text, "https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2026/example.pdf", "House")
+
+    assert [trade.symbol for trade in trades] == ["SOUN", "AAPL"]
+    assert trades[0].member == "Hon. Example Member"
+    assert trades[0].side == "buy"
+    assert trades[1].side == "sell"
+
+
+def test_refresh_congress_trades_filters_to_under_price_cap(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    settings.congress_max_price = 20
+    broker = build_broker(settings)
+    db = Database(settings.db_path)
+    engine = TradingEngine(settings=settings, broker=broker, db=db)
+
+    class FakeTracker:
+        def __init__(self, _settings, _price_lookup) -> None:
+            pass
+
+        def refresh(self) -> list[CongressTrade]:
+            return [
+                CongressTrade(
+                    member="Hon. Example Member",
+                    chamber="House",
+                    symbol="SOUN",
+                    asset="SoundHound AI, Inc. Class A Common Stock",
+                    side="buy",
+                    trade_date="02/10/2026",
+                    filed_date="02/25/2026",
+                    amount_range="$1,001 - $15,000",
+                    source_url="https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2026/example.pdf",
+                    current_price=13.25,
+                    under_price_cap=True,
+                )
+            ]
+
+    import tradebot.engine as engine_module
+
+    original_tracker = engine_module.CongressTracker
+    engine_module.CongressTracker = FakeTracker
+    try:
+        result = engine.refresh_congress_trades()
+    finally:
+        engine_module.CongressTracker = original_tracker
+
+    snapshot = engine.dashboard_snapshot()
+
+    assert result
+    assert snapshot["congress_trades"][0]["symbol"] == "SOUN"
+    assert snapshot["congress_trades"][0]["under_price_cap"] == 1
+
+
+def test_trade_once_with_congress_refresh_runs_refresh_first(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    engine = TradingEngine(settings=settings, broker=build_broker(settings), db=Database(settings.db_path))
+    calls: list[str] = []
+
+    def fake_refresh():
+        calls.append("refresh")
+        return []
+
+    def fake_trade_once():
+        calls.append("trade")
+        return {"sold": [], "bought": [], "candidates": []}
+
+    engine.refresh_congress_trades = fake_refresh  # type: ignore[method-assign]
+    engine.trade_once = fake_trade_once  # type: ignore[method-assign]
+
+    result = engine.trade_once_with_congress_refresh()
+
+    assert calls == ["refresh", "trade"]
+    assert result == {"sold": [], "bought": [], "candidates": []}
 
 
 def test_manage_positions_sells_when_stop_hit(tmp_path: Path):
@@ -265,6 +404,7 @@ class PositionBroker(BaseBroker):
         self._positions = positions or []
         self.last_buy = None
         self.sell_calls = []
+        self.cancel_calls = []
 
     def account(self) -> AccountSnapshot:
         market_value = sum(position.market_value for position in self._positions)
@@ -287,6 +427,10 @@ class PositionBroker(BaseBroker):
         self.sell_calls.append((symbol, qty))
         self._positions = [position for position in self._positions if position.symbol != symbol]
         return {"symbol": symbol, "qty": qty or 0, "filled_avg_price": 10.0, "status": "filled"}
+
+    def cancel_open_orders_for_symbol(self, symbol: str) -> int:
+        self.cancel_calls.append(symbol)
+        return 1
 
 
 def test_manage_positions_respects_min_hold_days_for_target_exit(tmp_path: Path):
@@ -395,3 +539,93 @@ def test_reconcile_broker_state_syncs_partial_fill_qty(tmp_path: Path):
     assert notes == [{"symbol": "AAPL", "note": "synced live position metadata"}]
     assert meta is not None
     assert float(meta["qty"]) == 3.0
+
+
+def test_buy_candidates_stores_stop_at_or_above_loss_cap_from_fill(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    settings.stop_loss_pct = 0.10
+    broker = CaptureBroker(settings)
+    engine = TradingEngine(settings=settings, broker=broker, db=Database(settings.db_path))
+    candidate = Candidate(
+        symbol="AAPL",
+        price=10.0,
+        final_score=90.0,
+        action="buy",
+        stop_price=8.7,
+        target_price=12.0,
+        reward_risk=2.0,
+        qty=2,
+    )
+
+    engine.buy_candidates([candidate])
+    meta = engine.db.get_position_meta("AAPL")
+
+    assert meta is not None
+    assert float(meta["stop_price"]) == 9.0
+
+
+def test_manage_positions_enforces_percent_loss_cap_when_stored_stop_is_looser(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    settings.broker_mode = "paper"
+    settings.stop_loss_pct = 0.10
+    settings.use_broker_protective_orders = True
+    position = PositionSnapshot(
+        symbol="AAPL",
+        qty=2,
+        avg_entry_price=10.0,
+        current_price=8.99,
+        market_value=17.98,
+        unrealized_pl_pct=-10.1,
+    )
+    broker = PositionBroker(settings, [position])
+    db = Database(settings.db_path)
+    engine = TradingEngine(settings=settings, broker=broker, db=db)
+    db.open_position_meta("AAPL", 2, 10.0, 8.5, 12.0, {"momentum": 100.0})
+
+    sold = engine.manage_positions()
+
+    assert sold
+    assert sold[0]["symbol"] == "AAPL"
+    assert sold[0]["note"] in {"stop hit", "loss cap"}
+    assert broker.cancel_calls == ["AAPL"]
+
+
+class PendingSellBroker(PositionBroker):
+    def sell(self, symbol: str, qty=None) -> dict:
+        self.sell_calls.append((symbol, qty))
+        self._positions = [position for position in self._positions if position.symbol != symbol]
+        return {"symbol": symbol, "qty": None, "filled_avg_price": None, "status": "accepted"}
+
+
+def test_manage_positions_handles_unfilled_sell_response(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    settings.broker_mode = "paper"
+    settings.stop_loss_pct = 0.10
+    settings.use_broker_protective_orders = True
+    position = PositionSnapshot(
+        symbol="AAPL",
+        qty=2,
+        avg_entry_price=10.0,
+        current_price=8.99,
+        market_value=17.98,
+        unrealized_pl_pct=-10.1,
+    )
+    broker = PendingSellBroker(settings, [position])
+    db = Database(settings.db_path)
+    engine = TradingEngine(settings=settings, broker=broker, db=db)
+    db.open_position_meta("AAPL", 2, 10.0, 8.5, 12.0, {"momentum": 100.0})
+    before = engine.learning_weights()
+
+    sold = engine.manage_positions()
+    trades = db.recent_trades(5)
+    meta = db.get_position_meta("AAPL")
+    after = engine.learning_weights()
+
+    assert sold
+    assert trades[0]["status"] == "accepted"
+    assert trades[0]["qty"] == 2.0
+    assert trades[0]["price"] == 8.99
+    assert trades[0]["pnl_pct"] is None
+    assert meta is not None
+    assert bool(meta["exit_pending"]) is True
+    assert after == before

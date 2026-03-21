@@ -51,6 +51,9 @@ class BaseBroker:
     def recent_filled_sell_orders(self, symbols: List[str]) -> Dict[str, dict]:
         return {}
 
+    def cancel_open_orders_for_symbol(self, symbol: str) -> int:
+        return 0
+
 
 class DemoBroker(BaseBroker):
     name = "demo"
@@ -349,6 +352,26 @@ class AlpacaBroker(BaseBroker):
             for leg in order.get("legs") or []:
                 visit(leg)
         return matched
+
+    def cancel_open_orders_for_symbol(self, symbol: str) -> int:
+        payload = self._request(
+            "GET",
+            f"{self.settings.trading_base_url}/v2/orders",
+            params={"status": "open", "limit": 100, "direction": "desc"},
+        )
+        canceled = 0
+        for order in payload if isinstance(payload, list) else []:
+            if order.get("symbol") != symbol:
+                continue
+            order_id = order.get("id")
+            if not order_id:
+                continue
+            try:
+                self._request("DELETE", f"{self.settings.trading_base_url}/v2/orders/{order_id}")
+                canceled += 1
+            except ProviderError:
+                continue
+        return canceled
 
 
 def build_broker(settings: Settings) -> BaseBroker:

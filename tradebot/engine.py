@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Dict, List
 
 from .analytics import compute_metrics
+from .congress import CongressTracker
 from .config import Settings
 from .mcp_bridge import analyze as analyze_with_mcp
 from .db import Database
@@ -111,11 +112,21 @@ class TradingEngine:
         self.db.record_scan(self.settings.broker_mode, self.broker.name, [c.model_dump() for c in trimmed])
         return trimmed
 
+    def refresh_congress_trades(self) -> List[dict]:
+        tracker = CongressTracker(self.settings, self.broker.latest_prices)
+        trades = [trade.model_dump() for trade in tracker.refresh()]
+        self.db.replace_congress_trades(trades)
+        return trades
+
     def _held_days(self, opened_at: str) -> int:
         opened = datetime.fromisoformat(opened_at)
         if opened.tzinfo is None:
             opened = opened.replace(tzinfo=timezone.utc)
         return max(0, (datetime.now(timezone.utc) - opened).days)
+
+    def _loss_stop_price(self, entry_price: float, stored_stop_price: float) -> float:
+        percent_stop = round(entry_price * (1 - self.settings.stop_loss_pct), 2)
+        return max(float(stored_stop_price), percent_stop)
 
     def reconcile_broker_state(self) -> List[dict]:
         tracked = {item["symbol"]: item for item in self.db.all_position_meta()}
@@ -170,24 +181,28 @@ class TradingEngine:
         broker_notes: List[dict] = []
         if self.settings.is_alpaca:
             broker_notes = self.reconcile_broker_state()
-            if self.settings.use_broker_protective_orders:
-                return broker_notes
         prices = self.broker.latest_prices([p.symbol for p in self.broker.positions()])
         sold: List[dict] = list(broker_notes)
         for position in self.broker.positions():
             meta = self.db.get_position_meta(position.symbol)
             if not meta:
                 continue
+            if bool(meta.get("exit_pending")):
+                continue
             current = prices.get(position.symbol, position.current_price)
             should_sell = False
             note = ""
             held_days = self._held_days(str(meta["opened_at"]))
-            if current <= float(meta["stop_price"]):
+            effective_stop_price = self._loss_stop_price(float(meta["entry_price"]), float(meta["stop_price"]))
+            if current <= effective_stop_price:
                 should_sell = True
                 note = "stop hit"
             elif self.settings.max_hold_days > 0 and held_days >= self.settings.max_hold_days:
                 should_sell = True
                 note = "time stop"
+            elif position.unrealized_pl_pct <= -(self.settings.stop_loss_pct * 100):
+                should_sell = True
+                note = "loss cap"
             elif position.unrealized_pl_pct <= -6:
                 should_sell = True
                 note = "drawdown cap"
@@ -196,18 +211,46 @@ class TradingEngine:
                 note = "target hit"
             if should_sell:
                 try:
+                    if self.settings.is_alpaca and self.settings.use_broker_protective_orders:
+                        self.broker.cancel_open_orders_for_symbol(position.symbol)
                     result = self.broker.sell(position.symbol, position.qty)
                 except ProviderError as exc:
                     self.db.record_trade(position.symbol, "sell", position.qty, current, "error", str(exc))
                     continue
-                closed = self.db.close_position_meta(position.symbol)
-                entry = float(closed["entry_price"]) if closed else position.avg_entry_price
-                pnl_pct = ((current - entry) / entry) * 100 if entry else 0.0
-                analysis = closed["analysis"] if closed else {}
-                self.db.record_trade(position.symbol, "sell", float(result.get("qty", position.qty)), float(result.get("filled_avg_price", current)), result.get("status", "submitted"), note, pnl_pct, analysis)
-                if analysis:
-                    self.db.update_learning(analysis, pnl_pct)
-                sold.append({"symbol": position.symbol, "pnl_pct": round(pnl_pct, 2), "note": note})
+                raw_qty = result.get("qty")
+                raw_price = result.get("filled_avg_price")
+                status = result.get("status", "submitted")
+                recorded_qty = float(raw_qty) if raw_qty not in (None, "") else float(position.qty)
+                recorded_price = float(raw_price) if raw_price not in (None, "") else float(current)
+                if status in {"filled"}:
+                    closed = self.db.close_position_meta(position.symbol)
+                    entry = float(closed["entry_price"]) if closed else position.avg_entry_price
+                    pnl_pct = ((recorded_price - entry) / entry) * 100 if entry else 0.0
+                    analysis = closed["analysis"] if closed else {}
+                    self.db.record_trade(
+                        position.symbol,
+                        "sell",
+                        recorded_qty,
+                        recorded_price,
+                        status,
+                        note,
+                        pnl_pct,
+                        analysis,
+                    )
+                    if analysis:
+                        self.db.update_learning(analysis, pnl_pct)
+                    sold.append({"symbol": position.symbol, "pnl_pct": round(pnl_pct, 2), "note": note})
+                else:
+                    self.db.set_exit_pending(position.symbol, True)
+                    self.db.record_trade(
+                        position.symbol,
+                        "sell",
+                        recorded_qty,
+                        recorded_price,
+                        status,
+                        note,
+                    )
+                    sold.append({"symbol": position.symbol, "note": f"{note} submitted"})
         return sold
 
     def buy_candidates(self, candidates: List[Candidate]) -> List[dict]:
@@ -242,9 +285,10 @@ class TradingEngine:
                 self.db.record_trade(candidate.symbol, "buy", qty or candidate.qty, candidate.price, "error", str(exc), analysis=candidate.analyst_scores)
                 continue
             fill_price = float(result.get("filled_avg_price") or candidate.price)
+            applied_stop_price = self._loss_stop_price(fill_price, candidate.stop_price)
             filled_qty = float(result.get("qty", qty))
             self.db.record_trade(candidate.symbol, "buy", filled_qty, fill_price, result.get("status", "submitted"), "entry", analysis=candidate.analyst_scores)
-            self.db.open_position_meta(candidate.symbol, filled_qty, fill_price, candidate.stop_price, candidate.target_price, candidate.analyst_scores)
+            self.db.open_position_meta(candidate.symbol, filled_qty, fill_price, applied_stop_price, candidate.target_price, candidate.analyst_scores)
             bought.append({"symbol": candidate.symbol, "qty": filled_qty, "price": fill_price})
             cash_left -= est_cost
             capital_left -= est_cost
@@ -258,11 +302,16 @@ class TradingEngine:
         bought = self.buy_candidates(candidates)
         return {"sold": sold, "bought": bought, "candidates": [c.model_dump() for c in candidates]}
 
+    def trade_once_with_congress_refresh(self) -> Dict[str, List[dict]]:
+        self.refresh_congress_trades()
+        return self.trade_once()
+
     def dashboard_snapshot(self) -> dict:
         account = self.broker.account()
         return {
             "account": account.model_dump(),
             "candidates": self.db.latest_candidates(),
+            "congress_trades": self.db.recent_congress_trades(self.settings.congress_trade_limit),
             "positions": [p.model_dump() for p in self.broker.positions()],
             "trades": self.db.recent_trades(25),
             "learning": self.db.learning_weights(),

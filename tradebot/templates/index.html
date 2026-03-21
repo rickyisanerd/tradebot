@@ -29,11 +29,12 @@
 <body>
 <div class="wrap">
   <h1>TradeBot MCP Dashboard</h1>
-  <p class="muted">Mode: {{ mode }} | Provider: {{ provider }} | Tiny chaos machine version for low-priced equities.</p>
+  <p class="muted">Mode: {{ mode }} | Provider: {{ provider }} | Auto trade: {% if auto_trade_enabled %}on every {{ auto_trade_interval_minutes }} minute(s){% else %}off{% endif %}.</p>
 
   <div class="section">
     <form method="post" action="/scan"><button>Run Scan</button></form>
     <form method="post" action="/trade-once"><button>Trade Once</button></form>
+    <form method="post" action="/refresh-congress"><button>Refresh Congress</button></form>
   </div>
 
   <div class="row">
@@ -90,6 +91,28 @@
   </div>
 
   <div class="grid-2">
+    <div class="card">
+      <h2>Congress trades under ${{ '%.2f'|format(congress_max_price) }}</h2>
+      <p class="muted">Recent congressional buys and sells currently trading below your congress price cap.</p>
+      <table>
+        <thead><tr><th>Member</th><th>Symbol</th><th>Side</th><th>Current</th><th>Trade Date</th><th>Filed</th></tr></thead>
+        <tbody>
+          {% for item in congress_trades %}
+          <tr>
+            <td>{{ item.member }}</td>
+            <td>{{ item.symbol }}</td>
+            <td>{{ item.side }}</td>
+            <td>{% if item.current_price is not none %}${{ '%.2f'|format(item.current_price) }}{% endif %}</td>
+            <td>{{ item.trade_date }}</td>
+            <td>{{ item.filed_date }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="6" class="muted">No congressional trades are cached yet. Add official PTR PDF URLs to <code>CONGRESS_REPORT_URLS</code>, then hit Refresh Congress.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
     <div class="card">
       <h2>Open positions</h2>
       <table>

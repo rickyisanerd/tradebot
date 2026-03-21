@@ -23,6 +23,7 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("scan", help="Run a single market scan")
     sub.add_parser("trade-once", help="Advance the market one step, manage open positions, and buy new candidates")
+    sub.add_parser("refresh-congress", help="Refresh cached congressional PTR trades from configured official report URLs")
     sub.add_parser("status", help="Print dashboard snapshot as JSON")
     sub.add_parser("dashboard", help="Run the FastAPI dashboard")
     args = parser.parse_args()
@@ -36,6 +37,10 @@ def main() -> int:
         return 0
     if args.command == "trade-once":
         result = engine.trade_once()
+        print(json.dumps(result, indent=2))
+        return 0
+    if args.command == "refresh-congress":
+        result = engine.refresh_congress_trades()
         print(json.dumps(result, indent=2))
         return 0
     if args.command == "status":

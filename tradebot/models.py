@@ -44,3 +44,17 @@ class TradeEvent(BaseModel):
     note: str = ""
     pnl_pct: Optional[float] = None
     analysis: Dict[str, float] = Field(default_factory=dict)
+
+
+class CongressTrade(BaseModel):
+    member: str
+    chamber: str
+    symbol: str
+    asset: str
+    side: str
+    trade_date: str
+    filed_date: str
+    amount_range: str
+    source_url: str
+    current_price: Optional[float] = None
+    under_price_cap: bool = False

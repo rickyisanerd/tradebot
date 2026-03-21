@@ -11,8 +11,10 @@ A small Python trading bot project that is built to work out of the box in **dem
   - risk
 - tracks what wins and loses in SQLite and adjusts analyzer weights over time
 - stores scan history, trades, open position metadata, and learning weights
+- can cache recent congressional PTR trades from official report PDFs and filter them under your price cap
 - provides a FastAPI dashboard showing:
   - current picks
+  - recent congressional buys and sells under your congress price cap
   - open positions
   - recent buys and sells
   - learning weights
@@ -80,6 +82,19 @@ Open:
 http://127.0.0.1:8008
 ```
 
+## Railway deploy
+
+This repo now includes [Procfile](c:/Users/ricky/OneDrive/Documents/tradebot_mcp_bot/tradebot_mcp_bot/Procfile) and [railway.json](c:/Users/ricky/OneDrive/Documents/tradebot_mcp_bot/tradebot_mcp_bot/railway.json) so Railway can deploy it directly from GitHub.
+
+Recommended Railway setup:
+
+- start command: `python -m tradebot.cli dashboard`
+- health check path: `/health`
+- public port: Railway injects `PORT` automatically, and the app now uses it by default
+- if you want SQLite state to survive redeploys, mount a Railway volume and set `DATA_DIR=/data` (or your chosen mounted path)
+
+If you do not mount a volume, local files like the SQLite database and demo broker state will be ephemeral on Railway.
+
 ## Environment variables
 
 The app reads its active settings from `tradebot/config.py`. Use `.env.example` as the shareable template and `.env` for machine-local secrets such as Alpaca credentials.
@@ -89,6 +104,8 @@ If you add a new key to `.env`, it will only affect runtime after the setting is
 `STOP_LOSS` (or `STOP_LOSS_PCT`) now controls the stop distance used when the bot computes exits. In Alpaca paper/live mode, `USE_BROKER_PROTECTIVE_ORDERS=true` submits bracket entry orders so Alpaca can hold the stop-loss and take-profit legs at the broker.
 
 `MIN_HOLD_DAYS` prevents routine target exits from firing too early, while `MAX_HOLD_DAYS` can enforce a time stop when set above `0`. `MAX_TOTAL_CAPITAL` and `MAX_OPEN_POSITIONS` cap how much exposure the bot is allowed to carry across the portfolio.
+
+`CONGRESS_REPORT_URLS` accepts a comma-separated list of official House or Senate PTR PDF URLs. Run `python -m tradebot.cli refresh-congress` or click `Refresh Congress` in the dashboard to cache those trades locally, price them through the active broker feed, and show only names trading at or below `CONGRESS_MAX_PRICE`. When hourly auto-trading is enabled, the dashboard now refreshes this congressional cache immediately before each scheduled trade cycle so the panel stays fresh.
 
 ## Git helper script
 

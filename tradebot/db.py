@@ -60,7 +60,8 @@ class Database:
                     entry_price REAL NOT NULL,
                     stop_price REAL NOT NULL,
                     target_price REAL NOT NULL,
-                    analysis_json TEXT NOT NULL
+                    analysis_json TEXT NOT NULL,
+                    exit_pending INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS learning (
@@ -71,8 +72,28 @@ class Database:
                     weight REAL NOT NULL DEFAULT 1.0,
                     updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS congress_trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    member TEXT NOT NULL,
+                    chamber TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    asset TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    trade_date TEXT NOT NULL,
+                    filed_date TEXT NOT NULL,
+                    amount_range TEXT NOT NULL,
+                    source_url TEXT NOT NULL,
+                    current_price REAL,
+                    under_price_cap INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE(source_url, symbol, side, trade_date, amount_range)
+                );
                 """
             )
+            columns = {row["name"] for row in con.execute("PRAGMA table_info(position_meta)").fetchall()}
+            if "exit_pending" not in columns:
+                con.execute("ALTER TABLE position_meta ADD COLUMN exit_pending INTEGER NOT NULL DEFAULT 0")
             for strategy in ("momentum", "reversion", "risk"):
                 con.execute(
                     """
@@ -88,7 +109,55 @@ class Database:
             con.execute(
                 "INSERT INTO scans(created_at, broker_mode, provider, candidates_json) VALUES (?, ?, ?, ?)",
                 (utc_now(), broker_mode, provider, json.dumps(candidates)),
+                )
+
+    def replace_congress_trades(self, trades: List[Dict[str, Any]]) -> None:
+        with self.connect() as con:
+            con.execute("DELETE FROM congress_trades")
+            for trade in trades:
+                con.execute(
+                    """
+                    INSERT INTO congress_trades(
+                        created_at, member, chamber, symbol, asset, side, trade_date, filed_date,
+                        amount_range, source_url, current_price, under_price_cap
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        utc_now(),
+                        trade["member"],
+                        trade["chamber"],
+                        trade["symbol"],
+                        trade["asset"],
+                        trade["side"],
+                        trade["trade_date"],
+                        trade["filed_date"],
+                        trade["amount_range"],
+                        trade["source_url"],
+                        trade.get("current_price"),
+                        1 if trade.get("under_price_cap") else 0,
+                    ),
+                )
+
+    def recent_congress_trades(self, limit: int = 20) -> List[Dict[str, Any]]:
+        with self.connect() as con:
+            rows = con.execute(
+                """
+                SELECT member, chamber, symbol, asset, side, trade_date, filed_date, amount_range,
+                       source_url, current_price, under_price_cap
+                FROM congress_trades
+                ORDER BY id DESC
+                """
+            ).fetchall()
+            items = [dict(row) for row in rows]
+            items.sort(
+                key=lambda item: (
+                    datetime.strptime(item["filed_date"], "%m/%d/%Y"),
+                    datetime.strptime(item["trade_date"], "%m/%d/%Y"),
+                ),
+                reverse=True,
             )
+            return items[:limit]
 
     def latest_candidates(self) -> List[Dict[str, Any]]:
         with self.connect() as con:
@@ -177,6 +246,13 @@ class Database:
         with self.connect() as con:
             con.execute("DELETE FROM position_meta WHERE symbol = ?", (symbol,))
         return existing
+
+    def set_exit_pending(self, symbol: str, pending: bool) -> None:
+        with self.connect() as con:
+            con.execute(
+                "UPDATE position_meta SET exit_pending = ? WHERE symbol = ?",
+                (1 if pending else 0, symbol),
+            )
 
     def learning_weights(self) -> Dict[str, Dict[str, float]]:
         with self.connect() as con:
