@@ -52,7 +52,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     def run_trade_cycle() -> None:
         with engine_lock:
-            engine.trade_once_with_congress_refresh()
+            engine.trade_once()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -101,7 +101,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/trade-once")
     async def trade_once():
-        run_trade_cycle()
+        with engine_lock:
+            engine.trade_once()
+        return RedirectResponse(url="/", status_code=303)
+
+    @app.post("/refresh-signals")
+    async def refresh_signals():
+        with engine_lock:
+            engine.refresh_all_signals()
         return RedirectResponse(url="/", status_code=303)
 
     @app.get("/api/status")

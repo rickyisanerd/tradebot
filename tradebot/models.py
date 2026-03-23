@@ -17,6 +17,7 @@ class Candidate(BaseModel):
     qty: int = 0
     analyst_scores: Dict[str, float] = Field(default_factory=dict)
     metrics: Dict[str, float] = Field(default_factory=dict)
+    signal_usage: Dict[str, str] = Field(default_factory=dict)
 
 
 class AccountSnapshot(BaseModel):

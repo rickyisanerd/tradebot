@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -89,12 +89,73 @@ class Database:
                     under_price_cap INTEGER NOT NULL DEFAULT 0,
                     UNIQUE(source_url, symbol, side, trade_date, amount_range)
                 );
+
+                CREATE TABLE IF NOT EXISTS sec_filings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    cik TEXT NOT NULL,
+                    form TEXT NOT NULL,
+                    filing_date TEXT NOT NULL,
+                    accession_number TEXT NOT NULL,
+                    primary_document TEXT NOT NULL,
+                    sec_url TEXT NOT NULL,
+                    UNIQUE(symbol, accession_number, form)
+                );
+
+                CREATE TABLE IF NOT EXISTS earnings_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    earnings_date TEXT NOT NULL,
+                    report_time TEXT NOT NULL,
+                    fiscal_date_ending TEXT NOT NULL,
+                    estimate TEXT NOT NULL,
+                    currency TEXT NOT NULL,
+                    UNIQUE(symbol, earnings_date, report_time)
+                );
+
+                CREATE TABLE IF NOT EXISTS macro_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    event_date TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    UNIQUE(event_type, event_date)
+                );
+
+                CREATE TABLE IF NOT EXISTS signal_status (
+                    source TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    last_attempt_at TEXT,
+                    last_success_at TEXT,
+                    error_message TEXT DEFAULT '',
+                    records_count INTEGER NOT NULL DEFAULT 0,
+                    failure_count INTEGER NOT NULL DEFAULT 0,
+                    next_retry_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS signal_refresh_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    records_count INTEGER NOT NULL DEFAULT 0,
+                    failure_count INTEGER NOT NULL DEFAULT 0,
+                    error_message TEXT DEFAULT '',
+                    next_retry_at TEXT
+                );
                 """
             )
             columns = {row["name"] for row in con.execute("PRAGMA table_info(position_meta)").fetchall()}
             if "exit_pending" not in columns:
                 con.execute("ALTER TABLE position_meta ADD COLUMN exit_pending INTEGER NOT NULL DEFAULT 0")
-            for strategy in ("momentum", "reversion", "risk"):
+            signal_columns = {row["name"] for row in con.execute("PRAGMA table_info(signal_status)").fetchall()}
+            if "failure_count" not in signal_columns:
+                con.execute("ALTER TABLE signal_status ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0")
+            if "next_retry_at" not in signal_columns:
+                con.execute("ALTER TABLE signal_status ADD COLUMN next_retry_at TEXT")
+            for strategy in ("decision_support", "momentum", "reversion", "risk"):
                 con.execute(
                     """
                     INSERT INTO learning(strategy, wins, losses, total_return, weight, updated_at)
@@ -158,6 +219,302 @@ class Database:
                 reverse=True,
             )
             return items[:limit]
+
+    def congress_signal_for_symbol(self, symbol: str, window_days: int) -> Dict[str, float]:
+        today = datetime.now(timezone.utc).date()
+        cutoff = today - timedelta(days=max(1, window_days))
+        with self.connect() as con:
+            rows = con.execute(
+                """
+                SELECT side, trade_date, filed_date
+                FROM congress_trades
+                WHERE symbol = ?
+                ORDER BY id DESC
+                """,
+                (symbol.upper(),),
+            ).fetchall()
+
+        buy_count = 0
+        sell_count = 0
+        latest_trade_days: int | None = None
+        latest_filed_days: int | None = None
+        for row in rows:
+            trade_date = datetime.strptime(row["trade_date"], "%m/%d/%Y").date()
+            if trade_date < cutoff:
+                continue
+            filed_date = datetime.strptime(row["filed_date"], "%m/%d/%Y").date()
+            age_trade = max(0, (today - trade_date).days)
+            age_filed = max(0, (today - filed_date).days)
+            if row["side"] == "buy":
+                buy_count += 1
+            else:
+                sell_count += 1
+            latest_trade_days = age_trade if latest_trade_days is None else min(latest_trade_days, age_trade)
+            latest_filed_days = age_filed if latest_filed_days is None else min(latest_filed_days, age_filed)
+
+        return {
+            "congress_buy_count": float(buy_count),
+            "congress_sell_count": float(sell_count),
+            "congress_net_count": float(buy_count - sell_count),
+            "days_since_congress_trade": float(latest_trade_days if latest_trade_days is not None else window_days + 1),
+            "days_since_congress_filed": float(latest_filed_days if latest_filed_days is not None else window_days + 1),
+        }
+
+    def replace_sec_filings_for_symbol(self, symbol: str, filings: List[Dict[str, Any]]) -> None:
+        with self.connect() as con:
+            con.execute("DELETE FROM sec_filings WHERE symbol = ?", (symbol.upper(),))
+            for filing in filings:
+                con.execute(
+                    """
+                    INSERT INTO sec_filings(
+                        created_at, symbol, cik, form, filing_date, accession_number, primary_document, sec_url
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        utc_now(),
+                        filing["symbol"].upper(),
+                        filing["cik"],
+                        filing["form"],
+                        filing["filing_date"],
+                        filing["accession_number"],
+                        filing["primary_document"],
+                        filing["sec_url"],
+                    ),
+                )
+
+    def sec_signal_for_symbol(self, symbol: str, window_days: int) -> Dict[str, float]:
+        today = datetime.now(timezone.utc).date()
+        cutoff = today - timedelta(days=max(1, window_days))
+        with self.connect() as con:
+            rows = con.execute(
+                """
+                SELECT form, filing_date
+                FROM sec_filings
+                WHERE symbol = ?
+                ORDER BY filing_date DESC
+                """,
+                (symbol.upper(),),
+            ).fetchall()
+
+        form4_count = 0
+        disclosure_count = 0
+        offering_count = 0
+        latest_filing_days: int | None = None
+        for row in rows:
+            filing_date = datetime.strptime(row["filing_date"], "%Y-%m-%d").date()
+            if filing_date < cutoff:
+                continue
+            age_days = max(0, (today - filing_date).days)
+            latest_filing_days = age_days if latest_filing_days is None else min(latest_filing_days, age_days)
+            form = row["form"]
+            if form == "4":
+                form4_count += 1
+            elif form in {"8-K", "10-K", "10-Q"}:
+                disclosure_count += 1
+            elif form in {"S-1", "S-1/A", "S-3", "S-3ASR", "424B1", "424B2", "424B3", "424B4", "424B5"}:
+                offering_count += 1
+
+        return {
+            "sec_form4_count": float(form4_count),
+            "sec_disclosure_count": float(disclosure_count),
+            "sec_offering_filing_count": float(offering_count),
+            "days_since_sec_filing": float(latest_filing_days if latest_filing_days is not None else window_days + 1),
+        }
+
+    def replace_earnings_events_for_symbol(self, symbol: str, events: List[Dict[str, Any]]) -> None:
+        with self.connect() as con:
+            con.execute("DELETE FROM earnings_events WHERE symbol = ?", (symbol.upper(),))
+            for event in events:
+                con.execute(
+                    """
+                    INSERT INTO earnings_events(
+                        created_at, symbol, earnings_date, report_time, fiscal_date_ending, estimate, currency
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        utc_now(),
+                        event["symbol"].upper(),
+                        event["earnings_date"],
+                        event["report_time"],
+                        event["fiscal_date_ending"],
+                        event["estimate"],
+                        event["currency"],
+                    ),
+                )
+
+    def earnings_signal_for_symbol(self, symbol: str, window_days: int) -> Dict[str, float]:
+        today = datetime.now(timezone.utc).date()
+        cutoff = today + timedelta(days=max(1, window_days))
+        with self.connect() as con:
+            rows = con.execute(
+                """
+                SELECT earnings_date, report_time
+                FROM earnings_events
+                WHERE symbol = ?
+                ORDER BY earnings_date ASC
+                """,
+                (symbol.upper(),),
+            ).fetchall()
+
+        next_earnings_days: int | None = None
+        before_open = 0
+        after_close = 0
+        for row in rows:
+            earnings_date = datetime.strptime(row["earnings_date"], "%Y-%m-%d").date()
+            if earnings_date > cutoff:
+                continue
+            days_until = (earnings_date - today).days
+            if days_until < 0:
+                continue
+            next_earnings_days = days_until if next_earnings_days is None else min(next_earnings_days, days_until)
+            report_time = (row["report_time"] or "").lower()
+            if report_time == "pre-market":
+                before_open += 1
+            elif report_time == "post-market":
+                after_close += 1
+
+        return {
+            "days_until_earnings": float(next_earnings_days if next_earnings_days is not None else window_days + 1),
+            "earnings_before_open_count": float(before_open),
+            "earnings_after_close_count": float(after_close),
+            "has_upcoming_earnings": 1.0 if next_earnings_days is not None else 0.0,
+        }
+
+    def replace_macro_events(self, events: List[Dict[str, Any]]) -> None:
+        with self.connect() as con:
+            con.execute("DELETE FROM macro_events")
+            for event in events:
+                con.execute(
+                    """
+                    INSERT INTO macro_events(created_at, event_type, event_date, source)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (utc_now(), event["event_type"], event["event_date"], event["source"]),
+                )
+
+    def macro_signal(self, window_days: int) -> Dict[str, float]:
+        today = datetime.now(timezone.utc).date()
+        cutoff = today + timedelta(days=max(1, window_days))
+        with self.connect() as con:
+            rows = con.execute(
+                """
+                SELECT event_type, event_date
+                FROM macro_events
+                ORDER BY event_date ASC
+                """
+            ).fetchall()
+
+        next_macro_days: int | None = None
+        cpi_count = 0
+        fomc_count = 0
+        for row in rows:
+            event_date = datetime.strptime(row["event_date"], "%Y-%m-%d").date()
+            if event_date > cutoff:
+                continue
+            days_until = (event_date - today).days
+            if days_until < 0:
+                continue
+            next_macro_days = days_until if next_macro_days is None else min(next_macro_days, days_until)
+            if row["event_type"] == "cpi":
+                cpi_count += 1
+            elif row["event_type"] == "fomc":
+                fomc_count += 1
+
+        return {
+            "days_until_macro_event": float(next_macro_days if next_macro_days is not None else window_days + 1),
+            "has_near_macro_event": 1.0 if next_macro_days is not None else 0.0,
+            "near_cpi_count": float(cpi_count),
+            "near_fomc_count": float(fomc_count),
+        }
+
+    def update_signal_status(
+        self,
+        source: str,
+        status: str,
+        *,
+        last_attempt_at: str | None = None,
+        last_success_at: str | None = None,
+        error_message: str = "",
+        records_count: int = 0,
+        failure_count: int | None = None,
+        next_retry_at: str | None = None,
+    ) -> None:
+        with self.connect() as con:
+            existing = con.execute(
+                "SELECT last_attempt_at, last_success_at, failure_count, next_retry_at FROM signal_status WHERE source = ?",
+                (source,),
+            ).fetchone()
+            current_attempt = existing["last_attempt_at"] if existing else None
+            current_success = existing["last_success_at"] if existing else None
+            current_failure_count = existing["failure_count"] if existing else 0
+            current_next_retry_at = existing["next_retry_at"] if existing else None
+            con.execute(
+                """
+                INSERT INTO signal_status(
+                    source, status, last_attempt_at, last_success_at, error_message, records_count, failure_count, next_retry_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source) DO UPDATE SET
+                    status=excluded.status,
+                    last_attempt_at=excluded.last_attempt_at,
+                    last_success_at=excluded.last_success_at,
+                    error_message=excluded.error_message,
+                    records_count=excluded.records_count,
+                    failure_count=excluded.failure_count,
+                    next_retry_at=excluded.next_retry_at
+                """,
+                (
+                    source,
+                    status,
+                    last_attempt_at or current_attempt,
+                    last_success_at or current_success,
+                    error_message,
+                    records_count,
+                    current_failure_count if failure_count is None else failure_count,
+                    current_next_retry_at if next_retry_at is None else next_retry_at,
+                ),
+            )
+
+    def signal_statuses(self) -> Dict[str, Dict[str, Any]]:
+        with self.connect() as con:
+            rows = con.execute("SELECT * FROM signal_status ORDER BY source").fetchall()
+            return {row["source"]: dict(row) for row in rows}
+
+    def record_signal_refresh_event(
+        self,
+        source: str,
+        status: str,
+        *,
+        records_count: int = 0,
+        failure_count: int = 0,
+        error_message: str = "",
+        next_retry_at: str | None = None,
+    ) -> None:
+        with self.connect() as con:
+            con.execute(
+                """
+                INSERT INTO signal_refresh_history(
+                    created_at, source, status, records_count, failure_count, error_message, next_retry_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (utc_now(), source, status, records_count, failure_count, error_message, next_retry_at),
+            )
+
+    def recent_signal_refresh_history(self, limit: int = 20) -> List[Dict[str, Any]]:
+        with self.connect() as con:
+            rows = con.execute(
+                """
+                SELECT created_at, source, status, records_count, failure_count, error_message, next_retry_at
+                FROM signal_refresh_history
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return [dict(row) for row in rows]
 
     def latest_candidates(self) -> List[Dict[str, Any]]:
         with self.connect() as con:

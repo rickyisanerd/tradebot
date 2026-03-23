@@ -1,4 +1,5 @@
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -8,8 +9,12 @@ from tradebot.config import Settings
 from tradebot.dashboard import TradingScheduler, create_app
 from tradebot.db import Database
 from tradebot.engine import TradingEngine
+from tradebot.earnings import EarningsTracker
+from tradebot.macro import MacroTracker
+from tradebot.mcp_bridge import analyze as analyze_with_mcp
 from tradebot.models import AccountSnapshot, Candidate, CongressTrade, PositionSnapshot
 from tradebot.providers import AlpacaBroker, BaseBroker, build_broker
+from tradebot.sec import SecTracker
 
 
 def make_settings(tmp_path: Path) -> Settings:
@@ -64,6 +69,9 @@ def test_api_status_reports_auto_trade_settings(tmp_path: Path):
     payload = response.json()
     assert payload["auto_trade_enabled"] is True
     assert payload["auto_trade_interval_minutes"] == 60
+    assert "signal_health" in payload
+    assert "signal_refresh_history" in payload
+    assert "degraded_mode" in payload
 
 
 def test_settings_prefers_port_env_for_deploys(tmp_path: Path):
@@ -115,6 +123,7 @@ def test_congress_tracker_parses_house_ptr_text(tmp_path: Path):
 def test_refresh_congress_trades_filters_to_under_price_cap(tmp_path: Path):
     settings = make_settings(tmp_path)
     settings.congress_max_price = 20
+    settings.congress_report_urls = ["https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2026/example.pdf"]
     broker = build_broker(settings)
     db = Database(settings.db_path)
     engine = TradingEngine(settings=settings, broker=broker, db=db)
@@ -156,6 +165,47 @@ def test_refresh_congress_trades_filters_to_under_price_cap(tmp_path: Path):
     assert snapshot["congress_trades"][0]["under_price_cap"] == 1
 
 
+def test_scan_market_includes_congress_external_inputs_in_candidate_metrics(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    settings.congress_report_urls = ["https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2026/example.pdf"]
+    db = Database(settings.db_path)
+    db.replace_congress_trades(
+        [
+            {
+                "member": "Hon. Example Member",
+                "chamber": "House",
+                "symbol": "HOOD",
+                "asset": "Robinhood Markets, Inc.",
+                "side": "buy",
+                "trade_date": "03/01/2026",
+                "filed_date": "03/10/2026",
+                "amount_range": "$1,001 - $15,000",
+                "source_url": "https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2026/example.pdf",
+                "current_price": 18.0,
+                "under_price_cap": True,
+            }
+        ]
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    db.update_signal_status(
+        "congress",
+        "ok",
+        last_attempt_at=now,
+        last_success_at=now,
+        records_count=1,
+    )
+    engine = TradingEngine(settings=settings, broker=build_broker(settings), db=db)
+
+    candidates = engine.scan_market()
+    hood = next((candidate for candidate in candidates if candidate.symbol == "HOOD"), None)
+
+    assert hood is not None
+    assert hood.metrics["congress_buy_count"] == 1.0
+    assert hood.metrics["congress_sell_count"] == 0.0
+    assert "decision_support" in hood.analyst_scores
+    assert hood.signal_usage["congress"] == "active"
+
+
 def test_trade_once_with_congress_refresh_runs_refresh_first(tmp_path: Path):
     settings = make_settings(tmp_path)
     engine = TradingEngine(settings=settings, broker=build_broker(settings), db=Database(settings.db_path))
@@ -165,17 +215,889 @@ def test_trade_once_with_congress_refresh_runs_refresh_first(tmp_path: Path):
         calls.append("refresh")
         return []
 
+    def fake_refresh_sec():
+        calls.append("refresh-sec")
+        return []
+
+    def fake_refresh_earnings():
+        calls.append("refresh-earnings")
+        return []
+
+    def fake_refresh_macro():
+        calls.append("refresh-macro")
+        return []
+
     def fake_trade_once():
         calls.append("trade")
         return {"sold": [], "bought": [], "candidates": []}
 
-    engine.refresh_congress_trades = fake_refresh  # type: ignore[method-assign]
+    def fake_refresh_all():
+        calls.append("refresh")
+        calls.append("refresh-sec")
+        calls.append("refresh-earnings")
+        calls.append("refresh-macro")
+        return {"congress": [], "sec": [], "earnings": [], "macro": []}
+
+    engine.refresh_all_signals = fake_refresh_all  # type: ignore[method-assign]
     engine.trade_once = fake_trade_once  # type: ignore[method-assign]
 
     result = engine.trade_once_with_congress_refresh()
 
-    assert calls == ["refresh", "trade"]
+    assert calls == ["refresh", "refresh-sec", "refresh-earnings", "refresh-macro", "trade"]
     assert result == {"sold": [], "bought": [], "candidates": []}
+
+
+def test_refresh_all_signals_runs_each_source(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    engine = TradingEngine(settings=settings, broker=build_broker(settings), db=Database(settings.db_path))
+    calls: list[str] = []
+
+    engine.refresh_congress_trades = lambda: calls.append("congress") or []  # type: ignore[method-assign]
+    engine.refresh_sec_filings = lambda: calls.append("sec") or []  # type: ignore[method-assign]
+    engine.refresh_earnings_events = lambda: calls.append("earnings") or []  # type: ignore[method-assign]
+    engine.refresh_macro_events = lambda: calls.append("macro") or []  # type: ignore[method-assign]
+
+    result = engine.refresh_all_signals()
+
+    assert calls == ["congress", "sec", "earnings", "macro"]
+    assert result == {"congress": [], "sec": [], "earnings": [], "macro": []}
+
+
+def test_mcp_bridge_includes_decision_support_score() -> None:
+    analysis = analyze_with_mcp(
+        {
+            "latest": 12.0,
+            "sma10": 11.7,
+            "sma20": 11.4,
+            "sma50": 10.9,
+            "rsi14": 58.0,
+            "momentum5": 4.0,
+            "momentum20": 12.0,
+            "volatility20": 24.0,
+            "atr": 0.45,
+            "atr_pct": 3.8,
+            "avg_dollar_volume": 4_500_000,
+            "swing_high20": 12.4,
+            "swing_low20": 9.8,
+            "reward_risk": 2.4,
+            "min_reward_risk": 1.8,
+        }
+    )
+
+    assert "decision_support" in analysis
+    assert analysis["decision_support"][0] > 50
+    assert analysis["decision_support"][1]
+
+
+def test_decision_support_rewards_recent_congress_buy_signal() -> None:
+    bullish = analyze_with_mcp(
+        {
+            "latest": 12.0,
+            "sma10": 11.7,
+            "sma20": 11.4,
+            "sma50": 10.9,
+            "rsi14": 58.0,
+            "momentum5": 4.0,
+            "momentum20": 12.0,
+            "volatility20": 24.0,
+            "atr": 0.45,
+            "atr_pct": 3.8,
+            "avg_dollar_volume": 4_500_000,
+            "swing_high20": 12.4,
+            "swing_low20": 9.8,
+            "reward_risk": 2.4,
+            "min_reward_risk": 1.8,
+            "congress_buy_count": 2.0,
+            "congress_sell_count": 0.0,
+            "congress_net_count": 2.0,
+            "days_since_congress_trade": 5.0,
+        }
+    )
+    bearish = analyze_with_mcp(
+        {
+            "latest": 12.0,
+            "sma10": 11.7,
+            "sma20": 11.4,
+            "sma50": 10.9,
+            "rsi14": 58.0,
+            "momentum5": 4.0,
+            "momentum20": 12.0,
+            "volatility20": 24.0,
+            "atr": 0.45,
+            "atr_pct": 3.8,
+            "avg_dollar_volume": 4_500_000,
+            "swing_high20": 12.4,
+            "swing_low20": 9.8,
+            "reward_risk": 2.4,
+            "min_reward_risk": 1.8,
+            "congress_buy_count": 0.0,
+            "congress_sell_count": 2.0,
+            "congress_net_count": -2.0,
+            "days_since_congress_trade": 5.0,
+        }
+    )
+
+    assert bullish["decision_support"][0] > bearish["decision_support"][0]
+    assert any("congress" in reason for reason in bullish["decision_support"][1])
+
+
+def test_decision_support_respects_zero_external_weight() -> None:
+    weighted = analyze_with_mcp(
+        {
+            "latest": 12.0,
+            "sma10": 11.7,
+            "sma20": 11.4,
+            "sma50": 10.9,
+            "rsi14": 58.0,
+            "momentum5": 4.0,
+            "momentum20": 12.0,
+            "volatility20": 24.0,
+            "atr": 0.45,
+            "atr_pct": 3.8,
+            "avg_dollar_volume": 4_500_000,
+            "swing_high20": 12.4,
+            "swing_low20": 9.8,
+            "reward_risk": 2.4,
+            "min_reward_risk": 1.8,
+            "sec_form4_count": 1.0,
+            "sec_disclosure_count": 1.0,
+            "sec_offering_filing_count": 1.0,
+            "days_since_sec_filing": 3.0,
+            "sec_weight": 1.0,
+        }
+    )
+    unweighted = analyze_with_mcp(
+        {
+            "latest": 12.0,
+            "sma10": 11.7,
+            "sma20": 11.4,
+            "sma50": 10.9,
+            "rsi14": 58.0,
+            "momentum5": 4.0,
+            "momentum20": 12.0,
+            "volatility20": 24.0,
+            "atr": 0.45,
+            "atr_pct": 3.8,
+            "avg_dollar_volume": 4_500_000,
+            "swing_high20": 12.4,
+            "swing_low20": 9.8,
+            "reward_risk": 2.4,
+            "min_reward_risk": 1.8,
+            "sec_form4_count": 1.0,
+            "sec_disclosure_count": 1.0,
+            "sec_offering_filing_count": 1.0,
+            "days_since_sec_filing": 3.0,
+            "sec_weight": 0.0,
+        }
+    )
+
+    assert weighted["decision_support"][0] < unweighted["decision_support"][0]
+    assert not any("SEC" in reason for reason in unweighted["decision_support"][1])
+
+
+def test_decision_support_penalizes_recent_sec_offering_signal() -> None:
+    clean = analyze_with_mcp(
+        {
+            "latest": 12.0,
+            "sma10": 11.7,
+            "sma20": 11.4,
+            "sma50": 10.9,
+            "rsi14": 58.0,
+            "momentum5": 4.0,
+            "momentum20": 12.0,
+            "volatility20": 24.0,
+            "atr": 0.45,
+            "atr_pct": 3.8,
+            "avg_dollar_volume": 4_500_000,
+            "swing_high20": 12.4,
+            "swing_low20": 9.8,
+            "reward_risk": 2.4,
+            "min_reward_risk": 1.8,
+            "sec_form4_count": 1.0,
+            "sec_disclosure_count": 1.0,
+            "sec_offering_filing_count": 0.0,
+            "days_since_sec_filing": 3.0,
+        }
+    )
+    diluted = analyze_with_mcp(
+        {
+            "latest": 12.0,
+            "sma10": 11.7,
+            "sma20": 11.4,
+            "sma50": 10.9,
+            "rsi14": 58.0,
+            "momentum5": 4.0,
+            "momentum20": 12.0,
+            "volatility20": 24.0,
+            "atr": 0.45,
+            "atr_pct": 3.8,
+            "avg_dollar_volume": 4_500_000,
+            "swing_high20": 12.4,
+            "swing_low20": 9.8,
+            "reward_risk": 2.4,
+            "min_reward_risk": 1.8,
+            "sec_form4_count": 1.0,
+            "sec_disclosure_count": 1.0,
+            "sec_offering_filing_count": 1.0,
+            "days_since_sec_filing": 3.0,
+        }
+    )
+
+    assert clean["decision_support"][0] > diluted["decision_support"][0]
+    assert any("offering" in reason for reason in diluted["decision_support"][1])
+
+
+def test_decision_support_penalizes_near_term_earnings() -> None:
+    calm = analyze_with_mcp(
+        {
+            "latest": 12.0,
+            "sma10": 11.7,
+            "sma20": 11.4,
+            "sma50": 10.9,
+            "rsi14": 58.0,
+            "momentum5": 4.0,
+            "momentum20": 12.0,
+            "volatility20": 24.0,
+            "atr": 0.45,
+            "atr_pct": 3.8,
+            "avg_dollar_volume": 4_500_000,
+            "swing_high20": 12.4,
+            "swing_low20": 9.8,
+            "reward_risk": 2.4,
+            "min_reward_risk": 1.8,
+            "has_upcoming_earnings": 1.0,
+            "days_until_earnings": 10.0,
+        }
+    )
+    imminent = analyze_with_mcp(
+        {
+            "latest": 12.0,
+            "sma10": 11.7,
+            "sma20": 11.4,
+            "sma50": 10.9,
+            "rsi14": 58.0,
+            "momentum5": 4.0,
+            "momentum20": 12.0,
+            "volatility20": 24.0,
+            "atr": 0.45,
+            "atr_pct": 3.8,
+            "avg_dollar_volume": 4_500_000,
+            "swing_high20": 12.4,
+            "swing_low20": 9.8,
+            "reward_risk": 2.4,
+            "min_reward_risk": 1.8,
+            "has_upcoming_earnings": 1.0,
+            "days_until_earnings": 1.0,
+        }
+    )
+
+    assert calm["decision_support"][0] > imminent["decision_support"][0]
+    assert any("earnings" in reason for reason in imminent["decision_support"][1])
+
+
+def test_decision_support_penalizes_near_term_macro_event() -> None:
+    quiet = analyze_with_mcp(
+        {
+            "latest": 12.0,
+            "sma10": 11.7,
+            "sma20": 11.4,
+            "sma50": 10.9,
+            "rsi14": 58.0,
+            "momentum5": 4.0,
+            "momentum20": 12.0,
+            "volatility20": 24.0,
+            "atr": 0.45,
+            "atr_pct": 3.8,
+            "avg_dollar_volume": 4_500_000,
+            "swing_high20": 12.4,
+            "swing_low20": 9.8,
+            "reward_risk": 2.4,
+            "min_reward_risk": 1.8,
+            "has_near_macro_event": 1.0,
+            "days_until_macro_event": 6.0,
+            "near_cpi_count": 0.0,
+            "near_fomc_count": 0.0,
+        }
+    )
+    event_risk = analyze_with_mcp(
+        {
+            "latest": 12.0,
+            "sma10": 11.7,
+            "sma20": 11.4,
+            "sma50": 10.9,
+            "rsi14": 58.0,
+            "momentum5": 4.0,
+            "momentum20": 12.0,
+            "volatility20": 24.0,
+            "atr": 0.45,
+            "atr_pct": 3.8,
+            "avg_dollar_volume": 4_500_000,
+            "swing_high20": 12.4,
+            "swing_low20": 9.8,
+            "reward_risk": 2.4,
+            "min_reward_risk": 1.8,
+            "has_near_macro_event": 1.0,
+            "days_until_macro_event": 1.0,
+            "near_cpi_count": 0.0,
+            "near_fomc_count": 1.0,
+        }
+    )
+
+    assert quiet["decision_support"][0] > event_risk["decision_support"][0]
+    assert any("macro" in reason.lower() or "fomc" in reason.lower() for reason in event_risk["decision_support"][1])
+
+
+def test_sec_tracker_extracts_recent_interesting_forms(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    settings.sec_user_agent = "TradeBot MCP test@example.com"
+    tracker = SecTracker(settings)
+
+    def fake_get_json(url: str) -> dict:
+        if url.endswith("company_tickers.json"):
+            return {"0": {"ticker": "HOOD", "cik_str": 1783879}}
+        return {
+            "filings": {
+                "recent": {
+                    "form": ["4", "8-K", "424B5", "SC 13G"],
+                    "filingDate": ["2026-03-20", "2026-03-18", "2026-03-15", "2026-03-14"],
+                    "accessionNumber": [
+                        "0001783879-26-000001",
+                        "0001783879-26-000002",
+                        "0001783879-26-000003",
+                        "0001783879-26-000004",
+                    ],
+                    "primaryDocument": ["x1.xml", "x2.htm", "x3.htm", "x4.htm"],
+                }
+            }
+        }
+
+    tracker._get_json = fake_get_json  # type: ignore[method-assign]
+
+    filings = tracker.refresh(["HOOD"])
+
+    assert [filing.form for filing in filings] == ["4", "8-K", "424B5"]
+    assert all(filing.symbol == "HOOD" for filing in filings)
+
+
+def test_earnings_tracker_filters_to_requested_symbols_and_window(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    settings.alpha_vantage_api_key = "demo"
+    settings.earnings_signal_window_days = 21
+    tracker = EarningsTracker(settings)
+    csv_text = """symbol,name,reportDate,fiscalDateEnding,estimate,currency,reportTime
+HOOD,Robinhood,2026-03-30,2025-12-31,0.12,USD,post-market
+AAPL,Apple,2026-04-25,2025-12-31,1.23,USD,post-market
+"""
+
+    events = tracker._parse_csv(csv_text, ["HOOD"])
+
+    assert len(events) == 1
+    assert events[0].symbol == "HOOD"
+
+
+def test_macro_tracker_parses_cpi_and_fomc_dates(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    tracker = MacroTracker(settings)
+    cpi_html = "<html><body>Consumer Price Index April 10, 2026 Consumer Price Index May 12, 2026</body></html>"
+    fomc_html = "<html><body>Federal Open Market Committee June 16, 2026 July 29, 2026</body></html>"
+
+    cpi_events = tracker._parse_cpi(cpi_html)
+    fomc_events = tracker._parse_fomc(fomc_html)
+
+    assert any(event.event_type == "cpi" for event in cpi_events)
+    assert any(event.event_type == "fomc" for event in fomc_events)
+
+
+def test_refresh_sec_filings_stores_symbol_signal_inputs(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    settings.sec_user_agent = "TradeBot MCP test@example.com"
+    db = Database(settings.db_path)
+    engine = TradingEngine(settings=settings, broker=build_broker(settings), db=db)
+
+    class FakeSecTracker:
+        def __init__(self, _settings) -> None:
+            pass
+
+        def refresh(self, symbols: list[str]):
+            return [
+                type(
+                    "SecFilingStub",
+                    (),
+                    {
+                        "__dict__": {
+                            "symbol": "HOOD",
+                            "cik": "0001783879",
+                            "form": "4",
+                            "filing_date": "2026-03-20",
+                            "accession_number": "0001783879-26-000001",
+                            "primary_document": "x1.xml",
+                            "sec_url": "https://www.sec.gov/Archives/edgar/data/1783879/000178387926000001/x1.xml",
+                        }
+                    },
+                )()
+            ]
+
+    import tradebot.engine as engine_module
+
+    original_tracker = engine_module.SecTracker
+    engine_module.SecTracker = FakeSecTracker
+    try:
+        result = engine.refresh_sec_filings()
+    finally:
+        engine_module.SecTracker = original_tracker
+
+    signal = db.sec_signal_for_symbol("HOOD", settings.sec_signal_window_days)
+
+    assert result
+    assert signal["sec_form4_count"] == 1.0
+    assert signal["sec_offering_filing_count"] == 0.0
+
+
+def test_refresh_earnings_events_stores_symbol_signal_inputs(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    settings.alpha_vantage_api_key = "demo"
+    db = Database(settings.db_path)
+    engine = TradingEngine(settings=settings, broker=build_broker(settings), db=db)
+
+    class FakeEarningsTracker:
+        def __init__(self, _settings) -> None:
+            pass
+
+        def refresh(self, symbols: list[str]):
+            return [
+                type(
+                    "EarningsEventStub",
+                    (),
+                    {
+                        "__dict__": {
+                            "symbol": "HOOD",
+                            "earnings_date": "2026-03-30",
+                            "report_time": "post-market",
+                            "fiscal_date_ending": "2025-12-31",
+                            "estimate": "0.12",
+                            "currency": "USD",
+                        }
+                    },
+                )()
+            ]
+
+    import tradebot.engine as engine_module
+
+    original_tracker = engine_module.EarningsTracker
+    engine_module.EarningsTracker = FakeEarningsTracker
+    try:
+        result = engine.refresh_earnings_events()
+    finally:
+        engine_module.EarningsTracker = original_tracker
+
+    signal = db.earnings_signal_for_symbol("HOOD", settings.earnings_signal_window_days)
+
+    assert result
+    assert signal["has_upcoming_earnings"] == 1.0
+
+
+def test_refresh_macro_events_stores_global_signal_inputs(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    db = Database(settings.db_path)
+    engine = TradingEngine(settings=settings, broker=build_broker(settings), db=db)
+
+    class FakeMacroTracker:
+        def __init__(self, _settings) -> None:
+            pass
+
+        def refresh(self):
+            return [
+                type(
+                    "MacroEventStub",
+                    (),
+                    {"__dict__": {"event_type": "fomc", "event_date": "2026-03-24", "source": "https://www.federalreserve.gov/"}},
+                )()
+            ]
+
+    import tradebot.engine as engine_module
+
+    original_tracker = engine_module.MacroTracker
+    engine_module.MacroTracker = FakeMacroTracker
+    try:
+        result = engine.refresh_macro_events()
+    finally:
+        engine_module.MacroTracker = original_tracker
+
+    signal = db.macro_signal(settings.macro_signal_window_days)
+
+    assert result
+    assert signal["has_near_macro_event"] == 1.0
+    assert signal["near_fomc_count"] == 1.0
+
+
+def test_refresh_source_failure_marks_degraded_mode_without_raising(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    settings.sec_user_agent = "TradeBot MCP test@example.com"
+    engine = TradingEngine(settings=settings, broker=build_broker(settings), db=Database(settings.db_path))
+
+    class FailingSecTracker:
+        def __init__(self, _settings) -> None:
+            pass
+
+        def refresh(self, symbols: list[str]):
+            raise RuntimeError("sec feed offline")
+
+    import tradebot.engine as engine_module
+
+    original_tracker = engine_module.SecTracker
+    engine_module.SecTracker = FailingSecTracker
+    try:
+        result = engine.refresh_sec_filings()
+    finally:
+        engine_module.SecTracker = original_tracker
+
+    status = engine.dashboard_snapshot()["signal_health"]["sec"]
+
+    assert result == []
+    assert status["status"] == "error"
+    assert engine.degraded_mode() is True
+
+
+def test_refresh_source_respects_backoff_and_skips_retry(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    settings.sec_user_agent = "TradeBot MCP test@example.com"
+    settings.sec_retry_minutes = 15
+    engine = TradingEngine(settings=settings, broker=build_broker(settings), db=Database(settings.db_path))
+    calls = {"count": 0}
+
+    class FailingSecTracker:
+        def __init__(self, _settings) -> None:
+            pass
+
+        def refresh(self, symbols: list[str]):
+            calls["count"] += 1
+            raise RuntimeError("sec feed offline")
+
+    import tradebot.engine as engine_module
+
+    original_tracker = engine_module.SecTracker
+    engine_module.SecTracker = FailingSecTracker
+    try:
+        first = engine.refresh_sec_filings()
+        second = engine.refresh_sec_filings()
+    finally:
+        engine_module.SecTracker = original_tracker
+
+    status = engine.dashboard_snapshot()["signal_health"]["sec"]
+
+    assert first == []
+    assert second == []
+    assert calls["count"] == 1
+    assert status["status"] == "backoff"
+    assert status["in_backoff"] is True
+
+
+def test_override_ignore_backoff_retries_source(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    settings.sec_user_agent = "TradeBot MCP test@example.com"
+    settings.sec_retry_minutes = 15
+    settings.sec_override_mode = "ignore-backoff"
+    engine = TradingEngine(settings=settings, broker=build_broker(settings), db=Database(settings.db_path))
+    calls = {"count": 0}
+
+    class FailingSecTracker:
+        def __init__(self, _settings) -> None:
+            pass
+
+        def refresh(self, symbols: list[str]):
+            calls["count"] += 1
+            raise RuntimeError("sec feed offline")
+
+    import tradebot.engine as engine_module
+
+    original_tracker = engine_module.SecTracker
+    engine_module.SecTracker = FailingSecTracker
+    try:
+        engine.refresh_sec_filings()
+        engine.refresh_sec_filings()
+    finally:
+        engine_module.SecTracker = original_tracker
+
+    status = engine.dashboard_snapshot()["signal_health"]["sec"]
+
+    assert calls["count"] == 2
+    assert status["override_mode"] == "ignore-backoff"
+
+
+def test_signal_refresh_history_records_success_and_failure(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    settings.sec_user_agent = "TradeBot MCP test@example.com"
+    engine = TradingEngine(settings=settings, broker=build_broker(settings), db=Database(settings.db_path))
+
+    class FailingSecTracker:
+        def __init__(self, _settings) -> None:
+            pass
+
+        def refresh(self, symbols: list[str]):
+            raise RuntimeError("sec feed offline")
+
+    import tradebot.engine as engine_module
+
+    original_tracker = engine_module.SecTracker
+    engine_module.SecTracker = FailingSecTracker
+    try:
+        engine.refresh_sec_filings()
+    finally:
+        engine_module.SecTracker = original_tracker
+
+    history = engine.dashboard_snapshot()["signal_refresh_history"]
+
+    assert history
+    assert history[0]["source"] == "sec"
+    assert history[0]["status"] == "error"
+    assert history[0]["failure_count"] == 1
+
+
+def test_signal_refresh_history_records_disabled_source(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    engine = TradingEngine(settings=settings, broker=build_broker(settings), db=Database(settings.db_path))
+
+    engine.refresh_congress_trades()
+    history = engine.dashboard_snapshot()["signal_refresh_history"]
+
+    assert history
+    assert history[0]["source"] == "congress"
+    assert history[0]["status"] == "disabled"
+
+
+def test_signal_health_respects_custom_freshness_threshold(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    settings.sec_user_agent = "TradeBot MCP test@example.com"
+    settings.sec_freshness_hours = 1
+    engine = TradingEngine(settings=settings, broker=build_broker(settings), db=Database(settings.db_path))
+    stale_time = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+    engine.db.update_signal_status(
+        "sec",
+        "ok",
+        last_attempt_at=stale_time,
+        last_success_at=stale_time,
+        records_count=1,
+    )
+
+    status = engine.dashboard_snapshot()["signal_health"]["sec"]
+
+    assert status["stale"] is True
+    assert engine.degraded_mode() is True
+
+
+def test_stale_signal_is_ignored_in_candidate_scoring(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    settings.congress_report_urls = ["https://example.com/report.pdf"]
+    settings.congress_freshness_hours = 1
+    db = Database(settings.db_path)
+    engine = TradingEngine(settings=settings, broker=build_broker(settings), db=db)
+    db.replace_congress_trades(
+        [
+            {
+                "member": "Hon. Example Member",
+                "chamber": "House",
+                "symbol": "HOOD",
+                "asset": "Robinhood Markets, Inc.",
+                "side": "buy",
+                "trade_date": "03/01/2026",
+                "filed_date": "03/10/2026",
+                "amount_range": "$1,001 - $15,000",
+                "source_url": "https://example.com/report.pdf",
+                "current_price": 18.0,
+                "under_price_cap": True,
+            }
+        ]
+    )
+    stale_time = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+    db.update_signal_status(
+        "congress",
+        "ok",
+        last_attempt_at=stale_time,
+        last_success_at=stale_time,
+        records_count=1,
+    )
+
+    candidates = engine.scan_market()
+    hood = next((candidate for candidate in candidates if candidate.symbol == "HOOD"), None)
+
+    assert hood is not None
+    assert hood.signal_usage["congress"] == "stale"
+    assert hood.metrics["congress_weight"] == 0.0
+    assert hood.metrics["congress_buy_count"] == 0.0
+
+
+def test_zero_weight_signal_is_reported_and_ignored(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    settings.congress_report_urls = ["https://example.com/report.pdf"]
+    settings.decision_support_congress_weight = 0.0
+    db = Database(settings.db_path)
+    engine = TradingEngine(settings=settings, broker=build_broker(settings), db=db)
+    db.replace_congress_trades(
+        [
+            {
+                "member": "Hon. Example Member",
+                "chamber": "House",
+                "symbol": "HOOD",
+                "asset": "Robinhood Markets, Inc.",
+                "side": "buy",
+                "trade_date": "03/01/2026",
+                "filed_date": "03/10/2026",
+                "amount_range": "$1,001 - $15,000",
+                "source_url": "https://example.com/report.pdf",
+                "current_price": 18.0,
+                "under_price_cap": True,
+            }
+        ]
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    db.update_signal_status(
+        "congress",
+        "ok",
+        last_attempt_at=now,
+        last_success_at=now,
+        records_count=1,
+    )
+
+    candidates = engine.scan_market()
+    hood = next((candidate for candidate in candidates if candidate.symbol == "HOOD"), None)
+
+    assert hood is not None
+    assert hood.signal_usage["congress"] == "weight=0"
+    assert hood.metrics["congress_weight"] == 0.0
+    assert hood.metrics["congress_buy_count"] == 0.0
+
+
+def test_low_confidence_signal_is_ignored_and_marks_degraded_mode(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    settings.congress_report_urls = ["https://example.com/report.pdf"]
+    settings.congress_min_records = 2
+    db = Database(settings.db_path)
+    engine = TradingEngine(settings=settings, broker=build_broker(settings), db=db)
+    db.replace_congress_trades(
+        [
+            {
+                "member": "Hon. Example Member",
+                "chamber": "House",
+                "symbol": "HOOD",
+                "asset": "Robinhood Markets, Inc.",
+                "side": "buy",
+                "trade_date": "03/01/2026",
+                "filed_date": "03/10/2026",
+                "amount_range": "$1,001 - $15,000",
+                "source_url": "https://example.com/report.pdf",
+                "current_price": 18.0,
+                "under_price_cap": True,
+            }
+        ]
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    db.update_signal_status(
+        "congress",
+        "ok",
+        last_attempt_at=now,
+        last_success_at=now,
+        records_count=1,
+    )
+
+    hood = next(candidate for candidate in engine.scan_market() if candidate.symbol == "HOOD")
+    health = engine.dashboard_snapshot()["signal_health"]["congress"]
+
+    assert hood.signal_usage["congress"] == "low-confidence"
+    assert hood.metrics["congress_buy_count"] == 0.0
+    assert health["low_confidence"] is True
+    assert engine.degraded_mode() is True
+
+
+def test_override_disabled_forces_source_off(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    settings.congress_report_urls = ["https://example.com/report.pdf"]
+    settings.congress_override_mode = "disabled"
+    db = Database(settings.db_path)
+    engine = TradingEngine(settings=settings, broker=build_broker(settings), db=db)
+    db.replace_congress_trades(
+        [
+            {
+                "member": "Hon. Example Member",
+                "chamber": "House",
+                "symbol": "HOOD",
+                "asset": "Robinhood Markets, Inc.",
+                "side": "buy",
+                "trade_date": "03/01/2026",
+                "filed_date": "03/10/2026",
+                "amount_range": "$1,001 - $15,000",
+                "source_url": "https://example.com/report.pdf",
+                "current_price": 18.0,
+                "under_price_cap": True,
+            }
+        ]
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    db.update_signal_status("congress", "ok", last_attempt_at=now, last_success_at=now, records_count=1)
+
+    hood = next(candidate for candidate in engine.scan_market() if candidate.symbol == "HOOD")
+    health = engine.dashboard_snapshot()["signal_health"]["congress"]
+
+    assert hood.signal_usage["congress"] == "disabled"
+    assert health["enabled"] is False
+    assert health["override_mode"] == "disabled"
+
+
+def test_override_trusted_allows_stale_source_usage(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    settings.congress_report_urls = ["https://example.com/report.pdf"]
+    settings.congress_freshness_hours = 1
+    settings.congress_override_mode = "trusted"
+    db = Database(settings.db_path)
+    engine = TradingEngine(settings=settings, broker=build_broker(settings), db=db)
+    db.replace_congress_trades(
+        [
+            {
+                "member": "Hon. Example Member",
+                "chamber": "House",
+                "symbol": "HOOD",
+                "asset": "Robinhood Markets, Inc.",
+                "side": "buy",
+                "trade_date": "03/01/2026",
+                "filed_date": "03/10/2026",
+                "amount_range": "$1,001 - $15,000",
+                "source_url": "https://example.com/report.pdf",
+                "current_price": 18.0,
+                "under_price_cap": True,
+            }
+        ]
+    )
+    stale_time = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+    db.update_signal_status("congress", "ok", last_attempt_at=stale_time, last_success_at=stale_time, records_count=1)
+
+    hood = next(candidate for candidate in engine.scan_market() if candidate.symbol == "HOOD")
+    health = engine.dashboard_snapshot()["signal_health"]["congress"]
+
+    assert hood.signal_usage["congress"] == "trusted"
+    assert hood.metrics["congress_buy_count"] == 1.0
+    assert health["stale"] is False
+    assert health["override_mode"] == "trusted"
+
+
+def test_no_data_signal_is_reported_without_degraded_mode(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    settings.congress_report_urls = ["https://example.com/report.pdf"]
+    db = Database(settings.db_path)
+    engine = TradingEngine(settings=settings, broker=build_broker(settings), db=db)
+    now = datetime.now(timezone.utc).isoformat()
+    db.update_signal_status(
+        "congress",
+        "ok",
+        last_attempt_at=now,
+        last_success_at=now,
+        records_count=0,
+    )
+
+    hood = next(candidate for candidate in engine.scan_market() if candidate.symbol == "HOOD")
+    health = engine.dashboard_snapshot()["signal_health"]["congress"]
+
+    assert hood.signal_usage["congress"] == "no-data"
+    assert health["no_data"] is True
+    assert engine.degraded_mode() is False
 
 
 def test_manage_positions_sells_when_stop_hit(tmp_path: Path):
@@ -365,13 +1287,21 @@ def test_reconcile_broker_managed_exits_updates_learning(tmp_path: Path):
     broker = BrokerManagedExitBroker(settings)
     db = Database(settings.db_path)
     engine = TradingEngine(settings=settings, broker=broker, db=db)
-    db.open_position_meta("AAPL", 2, 10.0, 9.5, 11.0, {"momentum": 100.0, "reversion": 50.0, "risk": 75.0})
+    db.open_position_meta(
+        "AAPL",
+        2,
+        10.0,
+        9.5,
+        11.0,
+        {"decision_support": 80.0, "momentum": 100.0, "reversion": 50.0, "risk": 75.0},
+    )
 
     before = engine.learning_weights()
     sold = engine.manage_positions()
     after = engine.learning_weights()
 
     assert sold == [{"symbol": "AAPL", "pnl_pct": 10.0, "note": "bracket"}]
+    assert after["decision_support"] > before["decision_support"]
     assert after["momentum"] > before["momentum"]
     assert db.get_position_meta("AAPL") is None
 

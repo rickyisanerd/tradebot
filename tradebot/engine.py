@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Dict, List
+from datetime import datetime, timedelta, timezone
+from typing import Callable, Dict, List
 
 from .analytics import compute_metrics
 from .congress import CongressTracker
 from .config import Settings
 from .mcp_bridge import analyze as analyze_with_mcp
 from .db import Database
+from .earnings import EarningsTracker
+from .macro import MacroTracker
 from .models import Candidate
 from .providers import BaseBroker, ProviderError
+from .sec import SecTracker
 
 
 @dataclass
@@ -23,6 +26,295 @@ class TradingEngine:
         raw = self.db.learning_weights()
         return {name: float(payload["weight"]) for name, payload in raw.items()}
 
+    def _stale_after_hours(self) -> Dict[str, int]:
+        return {
+            "congress": self.settings.congress_freshness_hours,
+            "sec": self.settings.sec_freshness_hours,
+            "earnings": self.settings.earnings_freshness_hours,
+            "macro": self.settings.macro_freshness_hours,
+        }
+
+    def _minimum_records(self) -> Dict[str, int]:
+        return {
+            "congress": self.settings.congress_min_records,
+            "sec": self.settings.sec_min_records,
+            "earnings": self.settings.earnings_min_records,
+            "macro": self.settings.macro_min_records,
+        }
+
+    def _retry_minutes(self) -> Dict[str, int]:
+        return {
+            "congress": self.settings.congress_retry_minutes,
+            "sec": self.settings.sec_retry_minutes,
+            "earnings": self.settings.earnings_retry_minutes,
+            "macro": self.settings.macro_retry_minutes,
+        }
+
+    def _override_modes(self) -> Dict[str, str]:
+        return {
+            "congress": self.settings.congress_override_mode,
+            "sec": self.settings.sec_override_mode,
+            "earnings": self.settings.earnings_override_mode,
+            "macro": self.settings.macro_override_mode,
+        }
+
+    def _signal_enabled(self, source: str) -> bool:
+        if self._override_modes()[source] == "disabled":
+            return False
+        if source == "congress":
+            return bool(self.settings.congress_report_urls)
+        if source == "sec":
+            return bool(self.settings.sec_user_agent)
+        if source == "earnings":
+            return bool(self.settings.alpha_vantage_api_key)
+        if source == "macro":
+            return True
+        return False
+
+    def _signal_health(self) -> Dict[str, dict]:
+        now = datetime.now(timezone.utc)
+        statuses = self.db.signal_statuses()
+        health: Dict[str, dict] = {}
+        for source in ("congress", "sec", "earnings", "macro"):
+            item = statuses.get(
+                source,
+                {
+                    "source": source,
+                    "status": "disabled" if not self._signal_enabled(source) else "unknown",
+                    "last_attempt_at": None,
+                    "last_success_at": None,
+                    "error_message": "",
+                    "records_count": 0,
+                },
+            )
+            stale = False
+            last_success_at = item.get("last_success_at")
+            if item["status"] == "ok" and last_success_at:
+                last_success = datetime.fromisoformat(str(last_success_at))
+                if last_success.tzinfo is None:
+                    last_success = last_success.replace(tzinfo=timezone.utc)
+                age_hours = (now - last_success).total_seconds() / 3600.0
+                stale = age_hours > self._stale_after_hours()[source]
+            minimum_records = self._minimum_records()[source]
+            records_count = int(item.get("records_count", 0) or 0)
+            low_confidence = item["status"] == "ok" and records_count > 0 and records_count < minimum_records
+            no_data = item["status"] == "ok" and records_count == 0
+            in_backoff = False
+            next_retry_at = item.get("next_retry_at")
+            if next_retry_at:
+                next_retry = datetime.fromisoformat(str(next_retry_at))
+                if next_retry.tzinfo is None:
+                    next_retry = next_retry.replace(tzinfo=timezone.utc)
+                in_backoff = next_retry > now
+            override_mode = self._override_modes()[source]
+            if override_mode == "trusted":
+                stale = False
+                low_confidence = False
+            if override_mode == "ignore-backoff":
+                in_backoff = False
+            health[source] = dict(item) | {
+                "enabled": self._signal_enabled(source),
+                "stale": stale,
+                "minimum_records": minimum_records,
+                "low_confidence": low_confidence,
+                "no_data": no_data,
+                "in_backoff": in_backoff,
+                "override_mode": override_mode,
+            }
+        return health
+
+    def degraded_mode(self) -> bool:
+        return any(
+            item["enabled"] and (item["status"] in {"error", "backoff"} or item["stale"] or item["low_confidence"])
+            for item in self._signal_health().values()
+        )
+
+    def _refresh_source(
+        self,
+        source: str,
+        callback: Callable[[], List[dict]],
+    ) -> List[dict]:
+        attempted_at = datetime.now(timezone.utc).isoformat()
+        if not self._signal_enabled(source):
+            self.db.update_signal_status(
+                source,
+                "disabled",
+                last_attempt_at=attempted_at,
+                error_message="",
+                records_count=0,
+                failure_count=0,
+                next_retry_at=None,
+            )
+            self.db.record_signal_refresh_event(source, "disabled", records_count=0, failure_count=0)
+            return []
+        current = self.db.signal_statuses().get(source)
+        if current and current.get("next_retry_at") and self._override_modes()[source] != "ignore-backoff":
+            next_retry = datetime.fromisoformat(str(current["next_retry_at"]))
+            if next_retry.tzinfo is None:
+                next_retry = next_retry.replace(tzinfo=timezone.utc)
+            if next_retry > datetime.now(timezone.utc):
+                self.db.update_signal_status(
+                    source,
+                    "backoff",
+                    last_attempt_at=current.get("last_attempt_at"),
+                    last_success_at=current.get("last_success_at"),
+                    error_message=str(current.get("error_message") or ""),
+                    records_count=int(current.get("records_count") or 0),
+                    failure_count=int(current.get("failure_count") or 0),
+                    next_retry_at=str(current["next_retry_at"]),
+                )
+                self.db.record_signal_refresh_event(
+                    source,
+                    "backoff",
+                    records_count=int(current.get("records_count") or 0),
+                    failure_count=int(current.get("failure_count") or 0),
+                    error_message=str(current.get("error_message") or ""),
+                    next_retry_at=str(current["next_retry_at"]),
+                )
+                return []
+        try:
+            records = callback()
+        except Exception as exc:  # noqa: BLE001
+            failure_count = int(current.get("failure_count") or 0) + 1 if current else 1
+            delay_minutes = self._retry_minutes()[source] * min(8, 2 ** (failure_count - 1))
+            next_retry_at = (datetime.now(timezone.utc) + timedelta(minutes=delay_minutes)).isoformat()
+            self.db.update_signal_status(
+                source,
+                "error",
+                last_attempt_at=attempted_at,
+                error_message=str(exc),
+                records_count=0,
+                failure_count=failure_count,
+                next_retry_at=next_retry_at,
+            )
+            self.db.record_signal_refresh_event(
+                source,
+                "error",
+                records_count=0,
+                failure_count=failure_count,
+                error_message=str(exc),
+                next_retry_at=next_retry_at,
+            )
+            return []
+        self.db.update_signal_status(
+            source,
+            "ok",
+            last_attempt_at=attempted_at,
+            last_success_at=attempted_at,
+            error_message="",
+            records_count=len(records),
+            failure_count=0,
+            next_retry_at=None,
+        )
+        self.db.record_signal_refresh_event(source, "ok", records_count=len(records), failure_count=0)
+        return records
+
+    def _external_decision_inputs(self, symbol: str) -> Dict[str, float]:
+        return (
+            self.db.congress_signal_for_symbol(symbol, self.settings.congress_signal_window_days)
+            | self.db.sec_signal_for_symbol(symbol, self.settings.sec_signal_window_days)
+            | self.db.earnings_signal_for_symbol(symbol, self.settings.earnings_signal_window_days)
+            | self.db.macro_signal(self.settings.macro_signal_window_days)
+        )
+
+    def _external_signal_controls(self, symbol: str) -> tuple[Dict[str, float], Dict[str, str]]:
+        raw = self._external_decision_inputs(symbol)
+        health = self._signal_health()
+        signal_usage: Dict[str, str] = {}
+        effective: Dict[str, float] = dict(raw)
+
+        source_fields = {
+            "congress": [
+                "congress_buy_count",
+                "congress_sell_count",
+                "congress_net_count",
+                "days_since_congress_trade",
+                "days_since_congress_filed",
+            ],
+            "sec": [
+                "sec_form4_count",
+                "sec_disclosure_count",
+                "sec_offering_filing_count",
+                "days_since_sec_filing",
+            ],
+            "earnings": [
+                "days_until_earnings",
+                "earnings_before_open_count",
+                "earnings_after_close_count",
+                "has_upcoming_earnings",
+            ],
+            "macro": [
+                "days_until_macro_event",
+                "has_near_macro_event",
+                "near_cpi_count",
+                "near_fomc_count",
+            ],
+        }
+        weight_keys = {
+            "congress": "congress_weight",
+            "sec": "sec_weight",
+            "earnings": "earnings_weight",
+            "macro": "macro_weight",
+        }
+        configured_weights = {
+            "congress": self.settings.decision_support_congress_weight,
+            "sec": self.settings.decision_support_sec_weight,
+            "earnings": self.settings.decision_support_earnings_weight,
+            "macro": self.settings.decision_support_macro_weight,
+        }
+
+        for source, fields in source_fields.items():
+            item = health[source]
+            if not item["enabled"]:
+                signal_usage[source] = "disabled"
+                effective[weight_keys[source]] = 0.0
+                for field in fields:
+                    effective[field] = 0.0
+                continue
+            if item["override_mode"] == "trusted":
+                signal_usage[source] = "trusted"
+                effective[weight_keys[source]] = configured_weights[source]
+                continue
+            if item["status"] == "error":
+                signal_usage[source] = "error"
+                effective[weight_keys[source]] = 0.0
+                for field in fields:
+                    effective[field] = 0.0
+                continue
+            if item["status"] == "backoff" or item["in_backoff"]:
+                signal_usage[source] = "backoff"
+                effective[weight_keys[source]] = 0.0
+                for field in fields:
+                    effective[field] = 0.0
+                continue
+            if item["stale"]:
+                signal_usage[source] = "stale"
+                effective[weight_keys[source]] = 0.0
+                for field in fields:
+                    effective[field] = 0.0
+                continue
+            if item["low_confidence"]:
+                signal_usage[source] = "low-confidence"
+                effective[weight_keys[source]] = 0.0
+                for field in fields:
+                    effective[field] = 0.0
+                continue
+            if item["no_data"]:
+                signal_usage[source] = "no-data"
+                effective[weight_keys[source]] = 0.0
+                for field in fields:
+                    effective[field] = 0.0
+                continue
+            if configured_weights[source] <= 0:
+                signal_usage[source] = "weight=0"
+                effective[weight_keys[source]] = 0.0
+                for field in fields:
+                    effective[field] = 0.0
+                continue
+            signal_usage[source] = "active"
+            effective[weight_keys[source]] = configured_weights[source]
+        return effective, signal_usage
+
     def _candidate_from_bars(self, symbol: str, bars: List[dict], buying_power: float) -> Candidate | None:
         if len(bars) < 30:
             return None
@@ -30,19 +322,6 @@ class TradingEngine:
         price = metrics["latest"]
         if not (self.settings.min_stock_price <= price <= self.settings.max_stock_price):
             return None
-
-        analysis = analyze_with_mcp(metrics, self.settings.analyzer_mode)
-        momentum_score, momentum_reasons = analysis["momentum"]
-        reversion_score, reversion_reasons = analysis["reversion"]
-        risk_score, risk_reasons = analysis["risk"]
-
-        weights = self.learning_weights()
-        total_weight = weights["momentum"] + weights["reversion"] + weights["risk"]
-        final_score = (
-            momentum_score * weights["momentum"]
-            + reversion_score * weights["reversion"]
-            + risk_score * weights["risk"]
-        ) / total_weight
 
         stop_from_atr = price - (metrics["atr"] * 1.6)
         stop_from_pct = price * (1 - self.settings.stop_loss_pct)
@@ -53,7 +332,37 @@ class TradingEngine:
         risk = max(0.01, price - stop_price)
         reward_risk = reward / risk
 
+        external_inputs, signal_usage = self._external_signal_controls(symbol)
+        analysis_input = dict(metrics)
+        analysis_input.update(
+            {
+                "reward_risk": reward_risk,
+                "stop_price": stop_price,
+                "target_price": target_price,
+                "risk_amount": risk,
+                "reward_amount": reward,
+                "min_reward_risk": self.settings.min_reward_risk,
+            }
+        )
+        analysis_input.update(external_inputs)
+        analysis = analyze_with_mcp(analysis_input, self.settings.analyzer_mode)
+        decision_support_score, decision_support_reasons = analysis["decision_support"]
+        momentum_score, momentum_reasons = analysis["momentum"]
+        reversion_score, reversion_reasons = analysis["reversion"]
+        risk_score, risk_reasons = analysis["risk"]
+
+        weights = self.learning_weights()
+        weighted_scores = {
+            "decision_support": decision_support_score,
+            "momentum": momentum_score,
+            "reversion": reversion_score,
+            "risk": risk_score,
+        }
+        total_weight = sum(weights[name] for name in weighted_scores)
+        final_score = sum(weighted_scores[name] * weights[name] for name in weighted_scores) / total_weight
+
         reasons = []
+        reasons.extend(decision_support_reasons[:2])
         reasons.extend(momentum_reasons[:2])
         reasons.extend(reversion_reasons[:2])
         reasons.extend(risk_reasons[:2])
@@ -64,9 +373,10 @@ class TradingEngine:
             and reward_risk >= self.settings.min_reward_risk
             and metrics["avg_dollar_volume"] >= self.settings.min_dollar_volume
             and risk_score >= 45
+            and decision_support_score >= 50
         ):
             action = "buy"
-            reasons.insert(0, "score, liquidity, and reward/risk all cleared the bar")
+            reasons.insert(0, "decision support, liquidity, and reward/risk all cleared the bar")
 
         risk_budget = max(50.0, buying_power * self.settings.risk_per_trade_pct)
         position_cap = max(100.0, buying_power * self.settings.max_position_pct)
@@ -88,11 +398,13 @@ class TradingEngine:
             reward_risk=round(reward_risk, 2),
             qty=qty,
             analyst_scores={
+                "decision_support": round(decision_support_score, 2),
                 "momentum": round(momentum_score, 2),
                 "reversion": round(reversion_score, 2),
                 "risk": round(risk_score, 2),
             },
-            metrics={k: round(v, 4) for k, v in metrics.items()},
+            metrics={k: round(v, 4) for k, v in (metrics | external_inputs).items()},
+            signal_usage=signal_usage,
         )
 
     def scan_market(self) -> List[Candidate]:
@@ -113,10 +425,58 @@ class TradingEngine:
         return trimmed
 
     def refresh_congress_trades(self) -> List[dict]:
-        tracker = CongressTracker(self.settings, self.broker.latest_prices)
-        trades = [trade.model_dump() for trade in tracker.refresh()]
-        self.db.replace_congress_trades(trades)
-        return trades
+        def run() -> List[dict]:
+            tracker = CongressTracker(self.settings, self.broker.latest_prices)
+            trades = [trade.model_dump() for trade in tracker.refresh()]
+            self.db.replace_congress_trades(trades)
+            return trades
+
+        return self._refresh_source("congress", run)
+
+    def refresh_sec_filings(self) -> List[dict]:
+        def run() -> List[dict]:
+            tracker = SecTracker(self.settings)
+            symbols = self.broker.universe()[: self.settings.scan_limit]
+            filings = [filing.__dict__ for filing in tracker.refresh(symbols)]
+            grouped: Dict[str, List[dict]] = {}
+            for filing in filings:
+                grouped.setdefault(filing["symbol"], []).append(filing)
+            for symbol in symbols:
+                self.db.replace_sec_filings_for_symbol(symbol, grouped.get(symbol, []))
+            return filings
+
+        return self._refresh_source("sec", run)
+
+    def refresh_earnings_events(self) -> List[dict]:
+        def run() -> List[dict]:
+            tracker = EarningsTracker(self.settings)
+            symbols = self.broker.universe()[: self.settings.scan_limit]
+            events = [event.__dict__ for event in tracker.refresh(symbols)]
+            grouped: Dict[str, List[dict]] = {}
+            for event in events:
+                grouped.setdefault(event["symbol"], []).append(event)
+            for symbol in symbols:
+                self.db.replace_earnings_events_for_symbol(symbol, grouped.get(symbol, []))
+            return events
+
+        return self._refresh_source("earnings", run)
+
+    def refresh_macro_events(self) -> List[dict]:
+        def run() -> List[dict]:
+            tracker = MacroTracker(self.settings)
+            events = [event.__dict__ for event in tracker.refresh()]
+            self.db.replace_macro_events(events)
+            return events
+
+        return self._refresh_source("macro", run)
+
+    def refresh_all_signals(self) -> Dict[str, List[dict]]:
+        return {
+            "congress": self.refresh_congress_trades(),
+            "sec": self.refresh_sec_filings(),
+            "earnings": self.refresh_earnings_events(),
+            "macro": self.refresh_macro_events(),
+        }
 
     def _held_days(self, opened_at: str) -> int:
         opened = datetime.fromisoformat(opened_at)
@@ -303,7 +663,11 @@ class TradingEngine:
         return {"sold": sold, "bought": bought, "candidates": [c.model_dump() for c in candidates]}
 
     def trade_once_with_congress_refresh(self) -> Dict[str, List[dict]]:
-        self.refresh_congress_trades()
+        self.refresh_all_signals()
+        return self.trade_once()
+
+    def trade_once_with_signal_refresh(self) -> Dict[str, List[dict]]:
+        self.refresh_all_signals()
         return self.trade_once()
 
     def dashboard_snapshot(self) -> dict:
@@ -315,6 +679,9 @@ class TradingEngine:
             "positions": [p.model_dump() for p in self.broker.positions()],
             "trades": self.db.recent_trades(25),
             "learning": self.db.learning_weights(),
+            "signal_health": self._signal_health(),
+            "signal_refresh_history": self.db.recent_signal_refresh_history(12),
+            "degraded_mode": self.degraded_mode(),
             "mode": self.settings.broker_mode,
             "provider": self.broker.name,
         }

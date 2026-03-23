@@ -136,3 +136,135 @@ def analyze_risk(metrics: Dict[str, float]) -> Tuple[float, List[str]]:
     else:
         score -= min(20, (metrics["volatility20"] - 35) * 0.5)
     return max(0.0, min(100.0, score)), reasons
+
+
+def analyze_decision_support(metrics: Dict[str, float]) -> Tuple[float, List[str]]:
+    score = 45.0
+    reasons: List[str] = []
+
+    reward_risk = metrics.get("reward_risk", 0.0)
+    min_reward_risk = metrics.get("min_reward_risk", 1.8)
+    if reward_risk >= min_reward_risk + 0.4:
+        score += 20
+        reasons.append("reward to risk leaves room for the setup to breathe")
+    elif reward_risk >= min_reward_risk:
+        score += 10
+        reasons.append("reward to risk clears the minimum bar")
+    else:
+        score -= min(20, (min_reward_risk - reward_risk) * 15)
+        reasons.append("reward to risk is a little skinny")
+
+    if metrics["latest"] > metrics["sma20"] > metrics["sma50"]:
+        score += 15
+        reasons.append("trend alignment supports follow through")
+    elif metrics["latest"] < metrics["sma20"]:
+        score -= 10
+        reasons.append("price is fighting the near term trend")
+
+    if 45 <= metrics["rsi14"] <= 70:
+        score += 10
+        reasons.append("RSI says momentum is firm without looking cooked")
+    elif metrics["rsi14"] > 78:
+        score -= 12
+        reasons.append("RSI looks stretched enough to invite profit taking")
+
+    if metrics["atr_pct"] <= 6 and metrics["volatility20"] <= 40:
+        score += 10
+        reasons.append("volatility profile is manageable")
+    elif metrics["atr_pct"] > 8:
+        score -= min(15, (metrics["atr_pct"] - 8) * 2)
+        reasons.append("volatility can yank this setup around")
+
+    if metrics["avg_dollar_volume"] >= 3_000_000:
+        score += 8
+        reasons.append("liquidity should make entries and exits cleaner")
+    elif metrics["avg_dollar_volume"] < 1_000_000:
+        score -= 10
+        reasons.append("thin liquidity makes trade management tougher")
+
+    if metrics["momentum20"] < -5:
+        score -= 8
+        reasons.append("medium term momentum is still leaning the wrong way")
+    elif metrics["momentum20"] > 25:
+        score -= 6
+        reasons.append("the move may already be a bit overextended")
+
+    congress_buy_count = metrics.get("congress_buy_count", 0.0)
+    congress_sell_count = metrics.get("congress_sell_count", 0.0)
+    congress_net_count = metrics.get("congress_net_count", 0.0)
+    days_since_congress_trade = metrics.get("days_since_congress_trade", 999.0)
+    congress_weight = max(0.0, metrics.get("congress_weight", 1.0))
+    if congress_buy_count > 0 and congress_sell_count == 0:
+        score += min(18, congress_buy_count * 6) * congress_weight
+        if congress_weight > 0 and days_since_congress_trade <= 14:
+            reasons.append("recent congress buying adds an external conviction signal")
+        elif congress_weight > 0:
+            reasons.append("congress buying lines up with the setup")
+    elif congress_sell_count > congress_buy_count:
+        score -= min(22, congress_sell_count * 8) * congress_weight
+        if congress_weight > 0:
+            reasons.append("recent congress selling leans against the trade")
+    elif congress_net_count == 0 and (congress_buy_count + congress_sell_count) > 0:
+        score -= 6 * congress_weight
+        if congress_weight > 0:
+            reasons.append("mixed congress activity keeps the signal muddy")
+
+    sec_form4_count = metrics.get("sec_form4_count", 0.0)
+    sec_disclosure_count = metrics.get("sec_disclosure_count", 0.0)
+    sec_offering_filing_count = metrics.get("sec_offering_filing_count", 0.0)
+    days_since_sec_filing = metrics.get("days_since_sec_filing", 999.0)
+    sec_weight = max(0.0, metrics.get("sec_weight", 1.0))
+    if sec_form4_count > 0:
+        score += min(12, sec_form4_count * 4) * sec_weight
+        if sec_weight > 0:
+            reasons.append("recent SEC insider filings add a real external signal")
+    if sec_disclosure_count > 0 and sec_offering_filing_count == 0 and days_since_sec_filing <= 10:
+        score += min(6, sec_disclosure_count * 2) * sec_weight
+        if sec_weight > 0:
+            reasons.append("fresh company disclosures reduce the odds of trading stale info")
+    if sec_offering_filing_count > 0:
+        score -= min(28, sec_offering_filing_count * 14) * sec_weight
+        if sec_weight > 0:
+            reasons.append("recent SEC offering paperwork can weigh on the setup")
+
+    has_upcoming_earnings = metrics.get("has_upcoming_earnings", 0.0)
+    days_until_earnings = metrics.get("days_until_earnings", 999.0)
+    earnings_weight = max(0.0, metrics.get("earnings_weight", 1.0))
+    if has_upcoming_earnings:
+        if days_until_earnings <= 1:
+            score -= 18 * earnings_weight
+            if earnings_weight > 0:
+                reasons.append("earnings are too close to pretend the setup is normal")
+        elif days_until_earnings <= 3:
+            score -= 12 * earnings_weight
+            if earnings_weight > 0:
+                reasons.append("near-term earnings add gap risk")
+        elif days_until_earnings <= 7:
+            score -= 6 * earnings_weight
+            if earnings_weight > 0:
+                reasons.append("earnings are close enough to keep position sizing honest")
+
+    has_near_macro_event = metrics.get("has_near_macro_event", 0.0)
+    days_until_macro_event = metrics.get("days_until_macro_event", 999.0)
+    near_fomc_count = metrics.get("near_fomc_count", 0.0)
+    near_cpi_count = metrics.get("near_cpi_count", 0.0)
+    macro_weight = max(0.0, metrics.get("macro_weight", 1.0))
+    if has_near_macro_event:
+        if days_until_macro_event <= 1:
+            score -= 12 * macro_weight
+            if macro_weight > 0:
+                reasons.append("macro event risk is immediate enough to distort normal price action")
+        elif days_until_macro_event <= 3:
+            score -= 8 * macro_weight
+            if macro_weight > 0:
+                reasons.append("major macro events are close enough to add market-wide whiplash risk")
+        if near_fomc_count > 0:
+            score -= 4 * macro_weight
+            if macro_weight > 0:
+                reasons.append("FOMC timing can override single-name setups")
+        elif near_cpi_count > 0:
+            score -= 3 * macro_weight
+            if macro_weight > 0:
+                reasons.append("CPI timing can jolt the whole tape")
+
+    return max(0.0, min(100.0, score)), reasons

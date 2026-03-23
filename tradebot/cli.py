@@ -23,7 +23,11 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("scan", help="Run a single market scan")
     sub.add_parser("trade-once", help="Advance the market one step, manage open positions, and buy new candidates")
+    sub.add_parser("refresh-signals", help="Refresh all cached external decision-support signals")
     sub.add_parser("refresh-congress", help="Refresh cached congressional PTR trades from configured official report URLs")
+    sub.add_parser("refresh-sec", help="Refresh cached SEC filing signals for the current scan universe")
+    sub.add_parser("refresh-earnings", help="Refresh cached earnings events for the current scan universe")
+    sub.add_parser("refresh-macro", help="Refresh cached CPI and FOMC calendar events")
     sub.add_parser("status", help="Print dashboard snapshot as JSON")
     sub.add_parser("dashboard", help="Run the FastAPI dashboard")
     args = parser.parse_args()
@@ -39,8 +43,24 @@ def main() -> int:
         result = engine.trade_once()
         print(json.dumps(result, indent=2))
         return 0
+    if args.command == "refresh-signals":
+        result = engine.refresh_all_signals()
+        print(json.dumps(result, indent=2))
+        return 0
     if args.command == "refresh-congress":
         result = engine.refresh_congress_trades()
+        print(json.dumps(result, indent=2))
+        return 0
+    if args.command == "refresh-sec":
+        result = engine.refresh_sec_filings()
+        print(json.dumps(result, indent=2))
+        return 0
+    if args.command == "refresh-earnings":
+        result = engine.refresh_earnings_events()
+        print(json.dumps(result, indent=2))
+        return 0
+    if args.command == "refresh-macro":
+        result = engine.refresh_macro_events()
         print(json.dumps(result, indent=2))
         return 0
     if args.command == "status":

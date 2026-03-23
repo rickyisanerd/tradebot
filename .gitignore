@@ -2,6 +2,9 @@
 .venv/
 __pycache__/
 .pytest_cache/
+.pytest_tmp/
+pytest_tmp/
+.codex_tmp*/
 *.py[cod]
 *.pyo
 *.pyd
