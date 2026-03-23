@@ -6,9 +6,10 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-from .analytics import analyze_momentum, analyze_reversion, analyze_risk
+from .analytics import analyze_decision_support, analyze_momentum, analyze_reversion, analyze_risk
 
 _SERVER_MAP = {
+    "decision_support": "decision_support_server.py",
     "momentum": "momentum_server.py",
     "reversion": "reversion_server.py",
     "risk": "risk_server.py",
@@ -36,11 +37,13 @@ def _run_server(server_name: str, metrics: Dict[str, float]) -> Tuple[float, Lis
 def analyze(metrics: Dict[str, float], mode: str = "embedded") -> Dict[str, Tuple[float, List[str]]]:
     if mode == "subprocess":
         return {
+            "decision_support": _run_server("decision_support", metrics),
             "momentum": _run_server("momentum", metrics),
             "reversion": _run_server("reversion", metrics),
             "risk": _run_server("risk", metrics),
         }
     return {
+        "decision_support": analyze_decision_support(metrics),
         "momentum": analyze_momentum(metrics),
         "reversion": analyze_reversion(metrics),
         "risk": analyze_risk(metrics),

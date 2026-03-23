@@ -12,12 +12,66 @@ from .universe import DEFAULT_UNIVERSE
 load_dotenv()
 
 
+def _env_ratio(*names: str, default: float) -> float:
+    for name in names:
+        raw = os.getenv(name)
+        if raw is None or not raw.strip():
+            continue
+        value = float(raw)
+        return value / 100.0 if value > 1 else value
+    return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
 @dataclass
 class Settings:
     app_name: str = "TradeBot MCP"
     broker_mode: str = field(default_factory=lambda: os.getenv("BROKER_MODE", "demo").lower())
     alpaca_key_id: str = field(default_factory=lambda: os.getenv("ALPACA_KEY_ID", ""))
     alpaca_secret_key: str = field(default_factory=lambda: os.getenv("ALPACA_SECRET_KEY", ""))
+    auto_trade_enabled: bool = field(default_factory=lambda: _env_bool("AUTO_TRADE_ENABLED", False))
+    auto_trade_interval_minutes: int = field(default_factory=lambda: int(os.getenv("AUTO_TRADE_INTERVAL_MINUTES", "60")))
+    congress_max_price: float = field(default_factory=lambda: float(os.getenv("CONGRESS_MAX_PRICE", os.getenv("MAX_STOCK_PRICE", "20"))))
+    congress_trade_limit: int = field(default_factory=lambda: int(os.getenv("CONGRESS_TRADE_LIMIT", "20")))
+    congress_signal_window_days: int = field(default_factory=lambda: int(os.getenv("CONGRESS_SIGNAL_WINDOW_DAYS", "45")))
+    congress_freshness_hours: int = field(default_factory=lambda: int(os.getenv("CONGRESS_FRESHNESS_HOURS", "24")))
+    congress_min_records: int = field(default_factory=lambda: int(os.getenv("CONGRESS_MIN_RECORDS", "1")))
+    congress_retry_minutes: int = field(default_factory=lambda: int(os.getenv("CONGRESS_RETRY_MINUTES", "15")))
+    congress_override_mode: str = field(default_factory=lambda: os.getenv("CONGRESS_OVERRIDE_MODE", "auto").strip().lower())
+    decision_support_congress_weight: float = field(default_factory=lambda: float(os.getenv("DECISION_SUPPORT_CONGRESS_WEIGHT", "1.0")))
+    sec_user_agent: str = field(default_factory=lambda: os.getenv("SEC_USER_AGENT", "").strip())
+    sec_signal_window_days: int = field(default_factory=lambda: int(os.getenv("SEC_SIGNAL_WINDOW_DAYS", "30")))
+    sec_filing_limit_per_symbol: int = field(default_factory=lambda: int(os.getenv("SEC_FILING_LIMIT_PER_SYMBOL", "20")))
+    sec_freshness_hours: int = field(default_factory=lambda: int(os.getenv("SEC_FRESHNESS_HOURS", "24")))
+    sec_min_records: int = field(default_factory=lambda: int(os.getenv("SEC_MIN_RECORDS", "1")))
+    sec_retry_minutes: int = field(default_factory=lambda: int(os.getenv("SEC_RETRY_MINUTES", "15")))
+    sec_override_mode: str = field(default_factory=lambda: os.getenv("SEC_OVERRIDE_MODE", "auto").strip().lower())
+    decision_support_sec_weight: float = field(default_factory=lambda: float(os.getenv("DECISION_SUPPORT_SEC_WEIGHT", "1.0")))
+    alpha_vantage_api_key: str = field(default_factory=lambda: os.getenv("ALPHA_VANTAGE_API_KEY", "").strip())
+    earnings_signal_window_days: int = field(default_factory=lambda: int(os.getenv("EARNINGS_SIGNAL_WINDOW_DAYS", "21")))
+    earnings_freshness_hours: int = field(default_factory=lambda: int(os.getenv("EARNINGS_FRESHNESS_HOURS", "24")))
+    earnings_min_records: int = field(default_factory=lambda: int(os.getenv("EARNINGS_MIN_RECORDS", "1")))
+    earnings_retry_minutes: int = field(default_factory=lambda: int(os.getenv("EARNINGS_RETRY_MINUTES", "15")))
+    earnings_override_mode: str = field(default_factory=lambda: os.getenv("EARNINGS_OVERRIDE_MODE", "auto").strip().lower())
+    decision_support_earnings_weight: float = field(default_factory=lambda: float(os.getenv("DECISION_SUPPORT_EARNINGS_WEIGHT", "1.0")))
+    macro_signal_window_days: int = field(default_factory=lambda: int(os.getenv("MACRO_SIGNAL_WINDOW_DAYS", "7")))
+    macro_freshness_hours: int = field(default_factory=lambda: int(os.getenv("MACRO_FRESHNESS_HOURS", "24")))
+    macro_min_records: int = field(default_factory=lambda: int(os.getenv("MACRO_MIN_RECORDS", "1")))
+    macro_retry_minutes: int = field(default_factory=lambda: int(os.getenv("MACRO_RETRY_MINUTES", "15")))
+    macro_override_mode: str = field(default_factory=lambda: os.getenv("MACRO_OVERRIDE_MODE", "auto").strip().lower())
+    decision_support_macro_weight: float = field(default_factory=lambda: float(os.getenv("DECISION_SUPPORT_MACRO_WEIGHT", "1.0")))
+    stop_loss_pct: float = field(default_factory=lambda: _env_ratio("STOP_LOSS_PCT", "STOP_LOSS", default=0.12))
+    use_broker_protective_orders: bool = field(default_factory=lambda: _env_bool("USE_BROKER_PROTECTIVE_ORDERS", True))
+    min_hold_days: int = field(default_factory=lambda: int(os.getenv("MIN_HOLD_DAYS", "0")))
+    max_hold_days: int = field(default_factory=lambda: int(os.getenv("MAX_HOLD_DAYS", "0")))
+    max_total_capital: float = field(default_factory=lambda: float(os.getenv("MAX_TOTAL_CAPITAL", "0")))
+    max_open_positions: int = field(default_factory=lambda: int(os.getenv("MAX_OPEN_POSITIONS", "0")))
     max_stock_price: float = field(default_factory=lambda: float(os.getenv("MAX_STOCK_PRICE", "20")))
     min_stock_price: float = field(default_factory=lambda: float(os.getenv("MIN_STOCK_PRICE", "2")))
     scan_limit: int = field(default_factory=lambda: int(os.getenv("SCAN_LIMIT", "40")))
@@ -28,8 +82,8 @@ class Settings:
     min_reward_risk: float = field(default_factory=lambda: float(os.getenv("MIN_REWARD_RISK", "1.8")))
     min_dollar_volume: float = field(default_factory=lambda: float(os.getenv("MIN_DOLLAR_VOLUME", "1000000")))
     lookback_days: int = field(default_factory=lambda: int(os.getenv("LOOKBACK_DAYS", "80")))
-    dashboard_host: str = field(default_factory=lambda: os.getenv("DASHBOARD_HOST", "127.0.0.1"))
-    dashboard_port: int = field(default_factory=lambda: int(os.getenv("DASHBOARD_PORT", "8008")))
+    dashboard_host: str = field(default_factory=lambda: os.getenv("DASHBOARD_HOST", "0.0.0.0"))
+    dashboard_port: int = field(default_factory=lambda: int(os.getenv("PORT", os.getenv("DASHBOARD_PORT", "8008"))))
     analyzer_mode: str = field(default_factory=lambda: os.getenv("ANALYZER_MODE", "embedded").lower())
     starting_cash: float = field(default_factory=lambda: float(os.getenv("STARTING_CASH", "100000")))
     demo_seed: int = field(default_factory=lambda: int(os.getenv("DEMO_SEED", "42")))
@@ -37,13 +91,16 @@ class Settings:
     db_path: Path = field(init=False)
     demo_state_path: Path = field(init=False)
     scan_universe: List[str] = field(init=False)
+    congress_report_urls: List[str] = field(init=False)
 
     def __post_init__(self) -> None:
         raw_universe = os.getenv("SCAN_UNIVERSE", "")
+        raw_congress_urls = os.getenv("CONGRESS_REPORT_URLS", "")
         if raw_universe.strip():
             self.scan_universe = [x.strip().upper() for x in raw_universe.split(",") if x.strip()]
         else:
             self.scan_universe = DEFAULT_UNIVERSE[: self.scan_limit]
+        self.congress_report_urls = [x.strip() for x in raw_congress_urls.split(",") if x.strip()]
         self.data_dir = Path(self.data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.data_dir / "tradebot.db"

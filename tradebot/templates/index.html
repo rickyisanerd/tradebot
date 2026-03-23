@@ -17,6 +17,8 @@
     .buy { color: #7ef29a; font-weight: bold; }
     .watch { color: #ffd166; font-weight: bold; }
     .pill { display: inline-block; padding: 4px 9px; border-radius: 999px; background: #273556; margin-right: 6px; margin-bottom: 6px; }
+    .warn { color: #ffb86b; font-weight: bold; }
+    .ok { color: #7ef29a; }
     form { display: inline-block; margin-right: 10px; }
     button { background: #5b8cff; color: white; border: 0; border-radius: 10px; padding: 10px 14px; cursor: pointer; font-weight: bold; }
     button:hover { opacity: 0.92; }
@@ -29,11 +31,16 @@
 <body>
 <div class="wrap">
   <h1>TradeBot MCP Dashboard</h1>
-  <p class="muted">Mode: {{ mode }} | Provider: {{ provider }} | Tiny chaos machine version for low-priced equities.</p>
+  <p class="muted">Mode: {{ mode }} | Provider: {{ provider }} | Auto trade: {% if auto_trade_enabled %}on every {{ auto_trade_interval_minutes }} minute(s){% else %}off{% endif %}.</p>
+  {% if degraded_mode %}
+  <p class="warn">Decision support is in degraded mode because one or more external signal sources are stale or failing. Trading still uses cached signals.</p>
+  {% endif %}
 
   <div class="section">
     <form method="post" action="/scan"><button>Run Scan</button></form>
     <form method="post" action="/trade-once"><button>Trade Once</button></form>
+    <form method="post" action="/refresh-signals"><button>Refresh Signals</button></form>
+    <form method="post" action="/refresh-congress"><button>Refresh Congress</button></form>
   </div>
 
   <div class="row">
@@ -49,7 +56,7 @@
       <table>
         <thead>
           <tr>
-            <th>Symbol</th><th>Action</th><th>Score</th><th>Price</th><th>R/R</th><th>Qty</th><th>Why</th>
+            <th>Symbol</th><th>Action</th><th>Score</th><th>Price</th><th>R/R</th><th>Qty</th><th>Why</th><th>Signals</th>
           </tr>
         </thead>
         <tbody>
@@ -62,9 +69,14 @@
             <td>{{ '%.2f'|format(c.reward_risk) }}</td>
             <td>{{ c.qty }}</td>
             <td>{% for r in c.reasons %}<span class="pill">{{ r }}</span>{% endfor %}</td>
+            <td>
+              {% for source, state in c.signal_usage.items() %}
+                <span class="pill">{{ source }}: {{ state }}</span>
+              {% endfor %}
+            </td>
           </tr>
           {% else %}
-          <tr><td colspan="7" class="muted">No scan results yet. Hit Run Scan and let the little goblin think.</td></tr>
+          <tr><td colspan="8" class="muted">No scan results yet. Hit Run Scan and let the little goblin think.</td></tr>
           {% endfor %}
         </tbody>
       </table>
@@ -90,6 +102,73 @@
   </div>
 
   <div class="grid-2">
+    <div class="card">
+      <h2>Signal health</h2>
+      <table>
+        <thead><tr><th>Source</th><th>Status</th><th>Records</th><th>Last success</th><th>Note</th></tr></thead>
+        <tbody>
+          {% for source, item in signal_health.items() %}
+          <tr>
+            <td>{{ source }}</td>
+            <td class="{% if item.status == 'ok' and not item.stale %}ok{% elif item.status == 'disabled' %}muted{% else %}warn{% endif %}">
+              {{ item.status }}{% if item.stale %} / stale{% endif %}{% if item.low_confidence %} / low-confidence{% endif %}{% if item.no_data %} / no-data{% endif %}{% if item.in_backoff %} / retrying-later{% endif %}{% if item.override_mode != 'auto' %} / {{ item.override_mode }}{% endif %}
+            </td>
+            <td>{{ item.records_count }}</td>
+            <td>{{ item.last_success_at[:19].replace('T', ' ') if item.last_success_at else '-' }}</td>
+            <td>
+              {{ item.error_message or ('minimum ' ~ item.minimum_records ~ ' record(s)' if item.low_confidence else ('not configured' if not item.enabled else '')) }}
+              {% if item.next_retry_at %}<br><span class="muted">retry after {{ item.next_retry_at[:19].replace('T', ' ') }}</span>{% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Signal refresh history</h2>
+      <table>
+        <thead><tr><th>Time</th><th>Source</th><th>Status</th><th>Records</th><th>Failures</th></tr></thead>
+        <tbody>
+          {% for item in signal_refresh_history %}
+          <tr>
+            <td>{{ item.created_at[:19].replace('T', ' ') }}</td>
+            <td>{{ item.source }}</td>
+            <td>{{ item.status }}</td>
+            <td>{{ item.records_count }}</td>
+            <td>{{ item.failure_count }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="5" class="muted">No signal refresh activity yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="grid-2">
+    <div class="card">
+      <h2>Congress trades under ${{ '%.2f'|format(congress_max_price) }}</h2>
+      <p class="muted">Recent congressional buys and sells currently trading below your congress price cap.</p>
+      <table>
+        <thead><tr><th>Member</th><th>Symbol</th><th>Side</th><th>Current</th><th>Trade Date</th><th>Filed</th></tr></thead>
+        <tbody>
+          {% for item in congress_trades %}
+          <tr>
+            <td>{{ item.member }}</td>
+            <td>{{ item.symbol }}</td>
+            <td>{{ item.side }}</td>
+            <td>{% if item.current_price is not none %}${{ '%.2f'|format(item.current_price) }}{% endif %}</td>
+            <td>{{ item.trade_date }}</td>
+            <td>{{ item.filed_date }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="6" class="muted">No congressional trades are cached yet. Add official PTR PDF URLs to <code>CONGRESS_REPORT_URLS</code>, then hit Refresh Congress.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
     <div class="card">
       <h2>Open positions</h2>
       <table>

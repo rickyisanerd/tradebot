@@ -42,11 +42,17 @@ class BaseBroker:
     def latest_prices(self, symbols: List[str]) -> Dict[str, float]:
         raise NotImplementedError
 
-    def buy(self, symbol: str, qty: int) -> dict:
+    def buy(self, symbol: str, qty: int, stop_price: Optional[float] = None, target_price: Optional[float] = None) -> dict:
         raise NotImplementedError
 
     def sell(self, symbol: str, qty: Optional[float] = None) -> dict:
         raise NotImplementedError
+
+    def recent_filled_sell_orders(self, symbols: List[str]) -> Dict[str, dict]:
+        return {}
+
+    def cancel_open_orders_for_symbol(self, symbol: str) -> int:
+        return 0
 
 
 class DemoBroker(BaseBroker):
@@ -119,7 +125,7 @@ class DemoBroker(BaseBroker):
         tick = int(state["tick"])
         out: Dict[str, float] = {}
         for symbol in symbols:
-            out[symbol] = self._bars_for_symbol(symbol, 3, tick)[-1]["c"]
+            out[symbol] = self._bars_for_symbol(symbol, max(30, self.settings.lookback_days), tick)[-1]["c"]
         return out
 
     def account(self) -> AccountSnapshot:
@@ -158,7 +164,7 @@ class DemoBroker(BaseBroker):
             )
         return sorted(positions, key=lambda x: x.market_value, reverse=True)
 
-    def buy(self, symbol: str, qty: int) -> dict:
+    def buy(self, symbol: str, qty: int, stop_price: Optional[float] = None, target_price: Optional[float] = None) -> dict:
         if qty <= 0:
             raise ProviderError("Quantity must be positive.")
         state = self._load()
@@ -290,7 +296,7 @@ class AlpacaBroker(BaseBroker):
                 prices[symbol] = float(price)
         return prices
 
-    def buy(self, symbol: str, qty: int) -> dict:
+    def buy(self, symbol: str, qty: int, stop_price: Optional[float] = None, target_price: Optional[float] = None) -> dict:
         order = {
             "symbol": symbol,
             "qty": qty,
@@ -298,6 +304,15 @@ class AlpacaBroker(BaseBroker):
             "type": "market",
             "time_in_force": "day",
         }
+        if (
+            self.settings.use_broker_protective_orders
+            and stop_price is not None
+            and target_price is not None
+            and target_price > stop_price
+        ):
+            order["order_class"] = "bracket"
+            order["take_profit"] = {"limit_price": round(float(target_price), 2)}
+            order["stop_loss"] = {"stop_price": round(float(stop_price), 2)}
         return self._request("POST", f"{self.settings.trading_base_url}/v2/orders", json=order)
 
     def sell(self, symbol: str, qty: Optional[float] = None) -> dict:
@@ -311,6 +326,52 @@ class AlpacaBroker(BaseBroker):
             "time_in_force": "day",
         }
         return self._request("POST", f"{self.settings.trading_base_url}/v2/orders", json=order)
+
+    def recent_filled_sell_orders(self, symbols: List[str]) -> Dict[str, dict]:
+        if not symbols:
+            return {}
+        payload = self._request(
+            "GET",
+            f"{self.settings.trading_base_url}/v2/orders",
+            params={"status": "closed", "limit": 100, "nested": "true", "direction": "desc"},
+        )
+        symbol_set = set(symbols)
+        matched: Dict[str, dict] = {}
+
+        def visit(order: dict) -> None:
+            symbol = order.get("symbol")
+            if symbol not in symbol_set or order.get("side") != "sell":
+                return
+            if order.get("status") != "filled":
+                return
+            if symbol not in matched:
+                matched[symbol] = order
+
+        for order in payload if isinstance(payload, list) else []:
+            visit(order)
+            for leg in order.get("legs") or []:
+                visit(leg)
+        return matched
+
+    def cancel_open_orders_for_symbol(self, symbol: str) -> int:
+        payload = self._request(
+            "GET",
+            f"{self.settings.trading_base_url}/v2/orders",
+            params={"status": "open", "limit": 100, "direction": "desc"},
+        )
+        canceled = 0
+        for order in payload if isinstance(payload, list) else []:
+            if order.get("symbol") != symbol:
+                continue
+            order_id = order.get("id")
+            if not order_id:
+                continue
+            try:
+                self._request("DELETE", f"{self.settings.trading_base_url}/v2/orders/{order_id}")
+                canceled += 1
+            except ProviderError:
+                continue
+        return canceled
 
 
 def build_broker(settings: Settings) -> BaseBroker:
