@@ -357,17 +357,23 @@ class TradingEngine:
             return raw_symbols[: self.settings.scan_limit]
 
         target_pool = max(self.settings.scan_limit * 4, self.settings.candidate_limit * 6)
-        batch_size = max(50, min(200, self.settings.scan_limit * 3))
+        batch_size = max(25, min(60, self.settings.scan_limit * 2))
         history_days = min(max(30, self.settings.lookback_days // 3), self.settings.lookback_days)
         baseline_liquidity = max(100_000.0, self.settings.min_dollar_volume * 0.5)
         ranked: List[tuple[float, str]] = []
         seen: set[str] = set()
+        max_batches = 4
 
         for start in range(0, len(raw_symbols), batch_size):
+            if start >= batch_size * max_batches:
+                break
             batch = raw_symbols[start : start + batch_size]
             if not batch:
                 break
-            bars = self.broker.bars(batch, history_days)
+            try:
+                bars = self.broker.bars(batch, history_days)
+            except ProviderError:
+                continue
             for symbol in batch:
                 if symbol in seen:
                     continue
@@ -483,9 +489,13 @@ class TradingEngine:
         )
 
     def scan_market(self) -> List[Candidate]:
-        account = self.broker.account()
-        symbols = self._candidate_symbol_pool()
-        bars = self.broker.bars(symbols, self.settings.lookback_days)
+        try:
+            account = self.broker.account()
+            symbols = self._candidate_symbol_pool()
+            bars = self.broker.bars(symbols, self.settings.lookback_days)
+        except ProviderError:
+            self.db.record_scan(self.settings.broker_mode, self.broker.name, [])
+            return []
         candidates: List[Candidate] = []
         for symbol in symbols:
             item = bars.get(symbol)
