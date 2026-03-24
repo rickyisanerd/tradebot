@@ -345,6 +345,51 @@ class TradingEngine:
             effective[weight_keys[source]] = configured_weights[source]
         return effective, signal_usage
 
+    def _avg_dollar_volume_from_bars(self, bars: List[dict], window: int = 20) -> float:
+        recent = bars[-max(1, window):]
+        if not recent:
+            return 0.0
+        return sum(float(bar["c"]) * float(bar["v"]) for bar in recent) / len(recent)
+
+    def _candidate_symbol_pool(self) -> List[str]:
+        raw_symbols = self.broker.universe()
+        if self.settings.scan_universe or not self.settings.is_alpaca:
+            return raw_symbols[: self.settings.scan_limit]
+
+        target_pool = max(self.settings.scan_limit * 4, self.settings.candidate_limit * 6)
+        batch_size = max(50, min(200, self.settings.scan_limit * 3))
+        history_days = min(max(30, self.settings.lookback_days // 3), self.settings.lookback_days)
+        baseline_liquidity = max(100_000.0, self.settings.min_dollar_volume * 0.5)
+        ranked: List[tuple[float, str]] = []
+        seen: set[str] = set()
+
+        for start in range(0, len(raw_symbols), batch_size):
+            batch = raw_symbols[start : start + batch_size]
+            if not batch:
+                break
+            bars = self.broker.bars(batch, history_days)
+            for symbol in batch:
+                if symbol in seen:
+                    continue
+                item = bars.get(symbol) or []
+                if len(item) < 20:
+                    continue
+                price = float(item[-1]["c"])
+                if not (self.settings.min_stock_price <= price <= self.settings.max_stock_price):
+                    continue
+                avg_dollar_volume = self._avg_dollar_volume_from_bars(item)
+                if avg_dollar_volume < baseline_liquidity:
+                    continue
+                ranked.append((avg_dollar_volume, symbol))
+                seen.add(symbol)
+            if len(ranked) >= target_pool:
+                break
+
+        if ranked:
+            ranked.sort(key=lambda item: item[0], reverse=True)
+            return [symbol for _, symbol in ranked[:target_pool]]
+        return raw_symbols[: self.settings.scan_limit]
+
     def _candidate_from_bars(self, symbol: str, bars: List[dict], buying_power: float) -> Candidate | None:
         if len(bars) < 30:
             return None
@@ -439,7 +484,7 @@ class TradingEngine:
 
     def scan_market(self) -> List[Candidate]:
         account = self.broker.account()
-        symbols = self.broker.universe()[: self.settings.scan_limit]
+        symbols = self._candidate_symbol_pool()
         bars = self.broker.bars(symbols, self.settings.lookback_days)
         candidates: List[Candidate] = []
         for symbol in symbols:
@@ -466,7 +511,7 @@ class TradingEngine:
     def refresh_sec_filings(self) -> List[dict]:
         def run() -> List[dict]:
             tracker = SecTracker(self.settings)
-            symbols = self.broker.universe()[: self.settings.scan_limit]
+            symbols = self._candidate_symbol_pool()[: self.settings.scan_limit]
             filings = [filing.__dict__ for filing in tracker.refresh(symbols)]
             grouped: Dict[str, List[dict]] = {}
             for filing in filings:
@@ -480,7 +525,7 @@ class TradingEngine:
     def refresh_earnings_events(self) -> List[dict]:
         def run() -> List[dict]:
             tracker = EarningsTracker(self.settings)
-            symbols = self.broker.universe()[: self.settings.scan_limit]
+            symbols = self._candidate_symbol_pool()[: self.settings.scan_limit]
             events = [event.__dict__ for event in tracker.refresh(symbols)]
             grouped: Dict[str, List[dict]] = {}
             for event in events:
