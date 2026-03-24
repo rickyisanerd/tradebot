@@ -1303,6 +1303,74 @@ def test_buy_candidates_passes_stop_and_target_to_broker(tmp_path: Path):
     }
 
 
+class LiquidityUniverseBroker(BaseBroker):
+    name = "liquidity-universe"
+
+    def __init__(self, settings: Settings, bars_by_symbol: dict[str, list[dict]]) -> None:
+        super().__init__(settings)
+        self.bars_by_symbol = bars_by_symbol
+
+    def universe(self):
+        return list(self.bars_by_symbol.keys())
+
+    def account(self) -> AccountSnapshot:
+        return AccountSnapshot(cash=1_000, equity=1_000, buying_power=1_000, mode=self.settings.broker_mode)
+
+    def positions(self):
+        return []
+
+    def bars(self, symbols, days):
+        return {symbol: self.bars_by_symbol[symbol][-days:] for symbol in symbols if symbol in self.bars_by_symbol}
+
+    def latest_prices(self, symbols):
+        return {symbol: float(self.bars_by_symbol[symbol][-1]["c"]) for symbol in symbols if symbol in self.bars_by_symbol}
+
+    def buy(self, symbol: str, qty: int, stop_price=None, target_price=None) -> dict:
+        return {"symbol": symbol, "qty": qty, "filled_avg_price": 10.0, "status": "filled"}
+
+    def sell(self, symbol: str, qty=None) -> dict:
+        return {"symbol": symbol, "qty": qty or 0, "filled_avg_price": 10.0, "status": "filled"}
+
+
+def _bars(price: float, volume: int, days: int = 40) -> list[dict]:
+    bars = []
+    for idx in range(days):
+        close = round(price * (1 + (idx / (days * 200))), 4)
+        bars.append({"t": f"2026-03-{(idx % 28) + 1:02d}", "o": close, "h": close * 1.01, "l": close * 0.99, "c": close, "v": volume})
+    return bars
+
+
+def test_candidate_symbol_pool_prefilters_for_price_and_liquidity(tmp_path: Path):
+    settings = Settings(data_dir=tmp_path)
+    settings.broker_mode = "paper"
+    settings.scan_limit = 3
+    settings.candidate_limit = 3
+    settings.min_stock_price = 2
+    settings.max_stock_price = 10
+    settings.min_dollar_volume = 1_000_000
+    settings.__post_init__()
+    broker = LiquidityUniverseBroker(
+        settings,
+        {
+            "JUNK1": _bars(5.0, 1_000),
+            "JUNK2": _bars(6.0, 2_000),
+            "HIGH1": _bars(12.0, 500_000),
+            "GOOD1": _bars(4.0, 600_000),
+            "GOOD2": _bars(8.0, 300_000),
+            "GOOD3": _bars(9.0, 250_000),
+        },
+    )
+    engine = TradingEngine(settings=settings, broker=broker, db=Database(settings.db_path))
+
+    pool = engine._candidate_symbol_pool()
+
+    assert "GOOD1" in pool
+    assert "GOOD2" in pool
+    assert "JUNK1" not in pool
+    assert "JUNK2" not in pool
+    assert "HIGH1" not in pool
+
+
 class BrokerManagedExitBroker(BaseBroker):
     name = "broker-managed"
 
