@@ -37,6 +37,7 @@ class Settings:
     alpaca_secret_key: str = field(default_factory=lambda: os.getenv("ALPACA_SECRET_KEY", ""))
     auto_trade_enabled: bool = field(default_factory=lambda: _env_bool("AUTO_TRADE_ENABLED", False))
     auto_trade_interval_minutes: int = field(default_factory=lambda: int(os.getenv("AUTO_TRADE_INTERVAL_MINUTES", "60")))
+    pdt_cooldown_hours: int = field(default_factory=lambda: int(os.getenv("PDT_COOLDOWN_HOURS", "20")))
     congress_max_price: float = field(default_factory=lambda: float(os.getenv("CONGRESS_MAX_PRICE", os.getenv("MAX_STOCK_PRICE", "20"))))
     congress_trade_limit: int = field(default_factory=lambda: int(os.getenv("CONGRESS_TRADE_LIMIT", "20")))
     congress_signal_window_days: int = field(default_factory=lambda: int(os.getenv("CONGRESS_SIGNAL_WINDOW_DAYS", "45")))
