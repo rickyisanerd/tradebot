@@ -12,6 +12,7 @@ import requests
 
 from .config import Settings
 from .models import AccountSnapshot, PositionSnapshot
+from .universe import DEFAULT_UNIVERSE
 
 
 class ProviderError(RuntimeError):
@@ -72,6 +73,9 @@ class DemoBroker(BaseBroker):
                 "orders": [],
             }
             self.state_path.write_text(json.dumps(payload, indent=2))
+
+    def universe(self) -> List[str]:
+        return self.settings.scan_universe or DEFAULT_UNIVERSE
 
     def _load(self) -> dict:
         return json.loads(self.state_path.read_text())
@@ -212,6 +216,8 @@ class AlpacaBroker(BaseBroker):
     def __init__(self, settings: Settings) -> None:
         super().__init__(settings)
         settings.validate_for_broker()
+        self._universe_cache: list[str] | None = None
+        self._universe_cached_at: datetime | None = None
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -220,6 +226,30 @@ class AlpacaBroker(BaseBroker):
                 "Content-Type": "application/json",
             }
         )
+
+    def universe(self) -> List[str]:
+        if self.settings.scan_universe:
+            return self.settings.scan_universe
+        now = datetime.now(timezone.utc)
+        if self._universe_cache and self._universe_cached_at and (now - self._universe_cached_at) < timedelta(hours=6):
+            return self._universe_cache
+        payload = self._request(
+            "GET",
+            f"{self.settings.trading_base_url}/v2/assets",
+            params={"status": "active", "asset_class": "us_equity"},
+        )
+        tradable = [
+            str(item["symbol"]).upper()
+            for item in payload if isinstance(payload, list)
+            if item.get("tradable") and not str(item.get("symbol", "")).startswith("$")
+        ]
+        # Rotate the available symbol set by day so a blank SCAN_UNIVERSE does not
+        # keep feeding the same small alphabetical slice into each scan.
+        rng = random.Random(int(now.strftime("%Y%m%d")))
+        rng.shuffle(tradable)
+        self._universe_cache = tradable
+        self._universe_cached_at = now
+        return tradable
 
     def _request(self, method: str, url: str, **kwargs) -> dict | list:
         last_error: Optional[Exception] = None
