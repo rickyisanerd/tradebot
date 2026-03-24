@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Dict, List
+from typing import Callable, Dict, List, Optional
 
 from .analytics import compute_metrics
 from .congress import CongressTracker
@@ -25,6 +25,36 @@ class TradingEngine:
     def learning_weights(self) -> Dict[str, float]:
         raw = self.db.learning_weights()
         return {name: float(payload["weight"]) for name, payload in raw.items()}
+
+    def _parse_timestamp(self, value: object) -> Optional[datetime]:
+        if not value:
+            return None
+        parsed = datetime.fromisoformat(str(value))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+
+    def _pdt_pause_until(self) -> Optional[datetime]:
+        cooldown = max(1, int(self.settings.pdt_cooldown_hours))
+        for trade in self.db.recent_trades(50):
+            if trade.get("side") != "buy" or trade.get("status") != "error":
+                continue
+            note = str(trade.get("note") or "").lower()
+            if "pattern day trading protection" not in note:
+                continue
+            created_at = self._parse_timestamp(trade.get("created_at"))
+            if created_at is None:
+                continue
+            pause_until = created_at + timedelta(hours=cooldown)
+            if pause_until > datetime.now(timezone.utc):
+                return pause_until
+        return None
+
+    def _buying_pause_reason(self) -> str:
+        pause_until = self._pdt_pause_until()
+        if pause_until is None:
+            return ""
+        return f"buying paused until {pause_until.isoformat()} after Alpaca PDT protection rejected a prior order"
 
     def _stale_after_hours(self) -> Dict[str, int]:
         return {
@@ -614,6 +644,9 @@ class TradingEngine:
         return sold
 
     def buy_candidates(self, candidates: List[Candidate]) -> List[dict]:
+        pause_reason = self._buying_pause_reason()
+        if pause_reason:
+            return []
         positions = self.broker.positions()
         existing = {p.symbol for p in positions}
         account = self.broker.account()
@@ -660,7 +693,11 @@ class TradingEngine:
         sold = self.manage_positions()
         candidates = self.scan_market()
         bought = self.buy_candidates(candidates)
-        return {"sold": sold, "bought": bought, "candidates": [c.model_dump() for c in candidates]}
+        payload = {"sold": sold, "bought": bought, "candidates": [c.model_dump() for c in candidates]}
+        pause_reason = self._buying_pause_reason()
+        if pause_reason:
+            payload["buying_paused_reason"] = pause_reason
+        return payload
 
     def trade_once_with_congress_refresh(self) -> Dict[str, List[dict]]:
         self.refresh_all_signals()
@@ -682,6 +719,7 @@ class TradingEngine:
             "signal_health": self._signal_health(),
             "signal_refresh_history": self.db.recent_signal_refresh_history(12),
             "degraded_mode": self.degraded_mode(),
+            "buying_paused_reason": self._buying_pause_reason(),
             "mode": self.settings.broker_mode,
             "provider": self.broker.name,
         }

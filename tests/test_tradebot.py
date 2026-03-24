@@ -72,6 +72,7 @@ def test_api_status_reports_auto_trade_settings(tmp_path: Path):
     assert "signal_health" in payload
     assert "signal_refresh_history" in payload
     assert "degraded_mode" in payload
+    assert "buying_paused_reason" in payload
 
 
 def test_settings_prefers_port_env_for_deploys(tmp_path: Path):
@@ -245,6 +246,24 @@ def test_trade_once_with_congress_refresh_runs_refresh_first(tmp_path: Path):
 
     assert calls == ["refresh", "refresh-sec", "refresh-earnings", "refresh-macro", "trade"]
     assert result == {"sold": [], "bought": [], "candidates": []}
+
+
+def test_dashboard_trade_once_refreshes_signals_before_trading(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    app = create_app(settings)
+    client = TestClient(app)
+    calls: list[str] = []
+
+    def fake_trade_once_with_signal_refresh():
+        calls.append("trade")
+        return {"sold": [], "bought": [], "candidates": []}
+
+    app.state.engine.trade_once_with_signal_refresh = fake_trade_once_with_signal_refresh  # type: ignore[method-assign]
+
+    response = client.post("/trade-once", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert calls == ["trade"]
 
 
 def test_refresh_all_signals_runs_each_source(tmp_path: Path):
@@ -1414,6 +1433,59 @@ def test_buy_candidates_respects_capital_and_position_limits(tmp_path: Path):
 
     assert result == []
     assert broker.last_buy is None
+
+
+def test_buy_candidates_pause_after_recent_pdt_rejection(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    settings.broker_mode = "paper"
+    settings.pdt_cooldown_hours = 24
+    broker = CaptureBroker(settings)
+    db = Database(settings.db_path)
+    engine = TradingEngine(settings=settings, broker=broker, db=db)
+    db.record_trade(
+        "AAPL",
+        "buy",
+        1,
+        10.0,
+        "error",
+        'Alpaca request failed: Alpaca error 403: {"code":40310100,"message":"trade denied due to pattern day trading protection"}',
+    )
+    candidate = Candidate(
+        symbol="MSFT",
+        price=10.0,
+        final_score=90.0,
+        action="buy",
+        stop_price=9.0,
+        target_price=12.0,
+        reward_risk=2.0,
+        qty=2,
+    )
+
+    result = engine.buy_candidates([candidate])
+
+    assert result == []
+    assert broker.last_buy is None
+    assert "pdt protection" in engine._buying_pause_reason().lower()
+
+
+def test_trade_once_reports_buying_pause_reason(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    settings.pdt_cooldown_hours = 24
+    db = Database(settings.db_path)
+    engine = TradingEngine(settings=settings, broker=build_broker(settings), db=db)
+    db.record_trade(
+        "AAPL",
+        "buy",
+        1,
+        10.0,
+        "error",
+        'Alpaca request failed: Alpaca error 403: {"code":40310100,"message":"trade denied due to pattern day trading protection"}',
+    )
+
+    result = engine.trade_once()
+
+    assert "buying_paused_reason" in result
+    assert "pdt protection" in result["buying_paused_reason"].lower()
 
 
 def test_reconcile_broker_state_creates_external_position_meta(tmp_path: Path):
