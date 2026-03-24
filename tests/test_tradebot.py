@@ -13,7 +13,7 @@ from tradebot.earnings import EarningsTracker
 from tradebot.macro import MacroTracker
 from tradebot.mcp_bridge import analyze as analyze_with_mcp
 from tradebot.models import AccountSnapshot, Candidate, CongressTrade, PositionSnapshot
-from tradebot.providers import AlpacaBroker, BaseBroker, build_broker
+from tradebot.providers import AlpacaBroker, BaseBroker, ProviderError, build_broker
 from tradebot.sec import SecTracker
 
 
@@ -1369,6 +1369,47 @@ def test_candidate_symbol_pool_prefilters_for_price_and_liquidity(tmp_path: Path
     assert "JUNK1" not in pool
     assert "JUNK2" not in pool
     assert "HIGH1" not in pool
+
+
+class FailingScanBroker(BaseBroker):
+    name = "failing-scan"
+
+    def __init__(self, settings: Settings) -> None:
+        super().__init__(settings)
+
+    def universe(self):
+        return ["AAPL", "MSFT", "NVDA"]
+
+    def account(self) -> AccountSnapshot:
+        return AccountSnapshot(cash=1_000, equity=1_000, buying_power=1_000, mode=self.settings.broker_mode)
+
+    def positions(self):
+        return []
+
+    def bars(self, symbols, days):
+        raise ProviderError("synthetic market data failure")
+
+    def latest_prices(self, symbols):
+        return {}
+
+    def buy(self, symbol: str, qty: int, stop_price=None, target_price=None) -> dict:
+        return {"symbol": symbol, "qty": qty, "filled_avg_price": 10.0, "status": "filled"}
+
+    def sell(self, symbol: str, qty=None) -> dict:
+        return {"symbol": symbol, "qty": qty or 0, "filled_avg_price": 10.0, "status": "filled"}
+
+
+def test_scan_market_returns_empty_list_when_provider_data_fetch_fails(tmp_path: Path):
+    settings = Settings(data_dir=tmp_path)
+    settings.broker_mode = "paper"
+    settings.scan_limit = 5
+    settings.__post_init__()
+    engine = TradingEngine(settings=settings, broker=FailingScanBroker(settings), db=Database(settings.db_path))
+
+    result = engine.scan_market()
+
+    assert result == []
+    assert engine.db.latest_candidates() == []
 
 
 class BrokerManagedExitBroker(BaseBroker):
