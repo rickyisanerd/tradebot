@@ -7,8 +7,6 @@ from typing import List
 
 from dotenv import load_dotenv
 
-from .universe import DEFAULT_UNIVERSE
-
 load_dotenv()
 
 
@@ -100,7 +98,7 @@ class Settings:
         if raw_universe.strip():
             self.scan_universe = [x.strip().upper() for x in raw_universe.split(",") if x.strip()]
         else:
-            self.scan_universe = DEFAULT_UNIVERSE[: self.scan_limit]
+            self.scan_universe = []
         self.congress_report_urls = [x.strip() for x in raw_congress_urls.split(",") if x.strip()]
         self.data_dir = Path(self.data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)

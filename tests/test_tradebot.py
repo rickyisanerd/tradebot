@@ -95,6 +95,20 @@ def test_settings_prefers_port_env_for_deploys(tmp_path: Path):
     assert settings.dashboard_port == 9000
 
 
+def test_settings_leaves_scan_universe_empty_when_not_configured(tmp_path: Path):
+    previous_scan_universe = os.environ.get("SCAN_UNIVERSE")
+    os.environ.pop("SCAN_UNIVERSE", None)
+    try:
+        settings = Settings(data_dir=tmp_path)
+    finally:
+        if previous_scan_universe is None:
+            os.environ.pop("SCAN_UNIVERSE", None)
+        else:
+            os.environ["SCAN_UNIVERSE"] = previous_scan_universe
+
+    assert settings.scan_universe == []
+
+
 def test_trading_scheduler_runs_callback_once() -> None:
     calls = []
     scheduler = TradingScheduler(3600, lambda: calls.append("tick"))
@@ -1198,6 +1212,39 @@ def test_alpaca_buy_uses_bracket_order_payload(tmp_path: Path):
     assert payload["take_profit"] == {"limit_price": 11.25}
 
 
+class UniverseAlpacaBroker(AlpacaBroker):
+    def __init__(self, settings: Settings, assets_payload) -> None:
+        self.assets_payload = assets_payload
+        super().__init__(settings)
+
+    def _request(self, method: str, url: str, **kwargs):
+        if url.endswith("/v2/assets"):
+            return self.assets_payload
+        return {"status": "accepted"}
+
+
+def test_alpaca_broker_builds_dynamic_universe_when_scan_universe_is_blank(tmp_path: Path):
+    settings = Settings(data_dir=tmp_path)
+    settings.broker_mode = "paper"
+    settings.alpaca_key_id = "key"
+    settings.alpaca_secret_key = "secret"
+    settings.__post_init__()
+    broker = UniverseAlpacaBroker(
+        settings,
+        [
+            {"symbol": "AAPL", "tradable": True},
+            {"symbol": "MSFT", "tradable": True},
+            {"symbol": "SPY", "tradable": True},
+            {"symbol": "$TEST", "tradable": True},
+            {"symbol": "NOPE", "tradable": False},
+        ],
+    )
+
+    universe = broker.universe()
+
+    assert sorted(universe) == ["AAPL", "MSFT", "SPY"]
+
+
 class CaptureBroker(BaseBroker):
     name = "capture"
 
@@ -1334,6 +1381,14 @@ def test_demo_latest_price_matches_bar_close(tmp_path: Path):
     bars = broker.bars([symbol], settings.lookback_days)[symbol]
 
     assert latest == bars[-1]["c"]
+
+
+def test_demo_broker_uses_default_universe_when_scan_universe_is_blank(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    settings.scan_universe = []
+    broker = build_broker(settings)
+
+    assert broker.universe()[:5] == ["SOFI", "HOOD", "F", "LCID", "OPEN"]
 
 
 def test_learning_update_caps_single_outlier_loss(tmp_path: Path):
