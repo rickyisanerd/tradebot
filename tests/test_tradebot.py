@@ -751,7 +751,7 @@ def test_refresh_macro_events_stores_global_signal_inputs(tmp_path: Path) -> Non
                 type(
                     "MacroEventStub",
                     (),
-                    {"__dict__": {"event_type": "fomc", "event_date": "2026-03-24", "source": "https://www.federalreserve.gov/"}},
+                    {"__dict__": {"event_type": "fomc", "event_date": (datetime.now(timezone.utc).date() + timedelta(days=2)).isoformat(), "source": "https://www.federalreserve.gov/"}},
                 )()
             ]
 
