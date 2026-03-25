@@ -604,6 +604,13 @@ class Database:
             con.execute("DELETE FROM position_meta WHERE symbol = ?", (symbol,))
         return existing
 
+    def update_stop_price(self, symbol: str, stop_price: float) -> None:
+        with self.connect() as con:
+            con.execute(
+                "UPDATE position_meta SET stop_price = ? WHERE symbol = ?",
+                (round(stop_price, 2), symbol),
+            )
+
     def set_exit_pending(self, symbol: str, pending: bool) -> None:
         with self.connect() as con:
             con.execute(
@@ -629,11 +636,11 @@ class Database:
                 losses = row["losses"] + (1 if pnl_pct <= 0 else 0)
                 # Keep learning responsive to outcome quality without letting one outlier
                 # trade pin every strategy to the floor or ceiling.
-                bounded_pnl = max(-12.0, min(12.0, float(pnl_pct)))
-                contribution = (bounded_pnl / 12.0) * (float(score) / 100.0)
+                bounded_pnl = max(-20.0, min(20.0, float(pnl_pct)))
+                contribution = (bounded_pnl / 20.0) * (float(score) / 100.0)
                 total_return = row["total_return"] + contribution
-                weight = 1.0 + (wins - losses) * 0.02 + total_return * 0.18
-                weight = max(0.5, min(1.8, weight))
+                weight = 1.0 + (wins - losses) * 0.05 + total_return * 0.30
+                weight = max(0.4, min(2.2, weight))
                 con.execute(
                     """
                     UPDATE learning

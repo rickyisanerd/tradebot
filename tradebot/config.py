@@ -33,8 +33,8 @@ class Settings:
     broker_mode: str = field(default_factory=lambda: os.getenv("BROKER_MODE", "demo").lower())
     alpaca_key_id: str = field(default_factory=lambda: os.getenv("ALPACA_KEY_ID", ""))
     alpaca_secret_key: str = field(default_factory=lambda: os.getenv("ALPACA_SECRET_KEY", ""))
-    auto_trade_enabled: bool = field(default_factory=lambda: _env_bool("AUTO_TRADE_ENABLED", False))
-    auto_trade_interval_minutes: int = field(default_factory=lambda: int(os.getenv("AUTO_TRADE_INTERVAL_MINUTES", "60")))
+    auto_trade_enabled: bool = field(default_factory=lambda: _env_bool("AUTO_TRADE_ENABLED", True))
+    auto_trade_interval_minutes: int = field(default_factory=lambda: int(os.getenv("AUTO_TRADE_INTERVAL_MINUTES", "30")))
     pdt_cooldown_hours: int = field(default_factory=lambda: int(os.getenv("PDT_COOLDOWN_HOURS", "20")))
     congress_max_price: float = field(default_factory=lambda: float(os.getenv("CONGRESS_MAX_PRICE", os.getenv("MAX_STOCK_PRICE", "20"))))
     congress_trade_limit: int = field(default_factory=lambda: int(os.getenv("CONGRESS_TRADE_LIMIT", "20")))
@@ -69,16 +69,16 @@ class Settings:
     use_broker_protective_orders: bool = field(default_factory=lambda: _env_bool("USE_BROKER_PROTECTIVE_ORDERS", True))
     min_hold_days: int = field(default_factory=lambda: int(os.getenv("MIN_HOLD_DAYS", "0")))
     max_hold_days: int = field(default_factory=lambda: int(os.getenv("MAX_HOLD_DAYS", "0")))
-    max_total_capital: float = field(default_factory=lambda: float(os.getenv("MAX_TOTAL_CAPITAL", "0")))
-    max_open_positions: int = field(default_factory=lambda: int(os.getenv("MAX_OPEN_POSITIONS", "0")))
+    max_total_capital: float = field(default_factory=lambda: float(os.getenv("MAX_TOTAL_CAPITAL", "500")))
+    max_open_positions: int = field(default_factory=lambda: int(os.getenv("MAX_OPEN_POSITIONS", "5")))
     max_stock_price: float = field(default_factory=lambda: float(os.getenv("MAX_STOCK_PRICE", "20")))
     min_stock_price: float = field(default_factory=lambda: float(os.getenv("MIN_STOCK_PRICE", "2")))
     scan_limit: int = field(default_factory=lambda: int(os.getenv("SCAN_LIMIT", "40")))
     candidate_limit: int = field(default_factory=lambda: int(os.getenv("CANDIDATE_LIMIT", "12")))
     max_new_positions_per_run: int = field(default_factory=lambda: int(os.getenv("MAX_NEW_POSITIONS_PER_RUN", "3")))
-    risk_per_trade_pct: float = field(default_factory=lambda: float(os.getenv("RISK_PER_TRADE_PCT", "0.01")))
-    max_position_pct: float = field(default_factory=lambda: float(os.getenv("MAX_POSITION_PCT", "0.10")))
-    min_reward_risk: float = field(default_factory=lambda: float(os.getenv("MIN_REWARD_RISK", "1.8")))
+    risk_per_trade_pct: float = field(default_factory=lambda: float(os.getenv("RISK_PER_TRADE_PCT", "0.04")))
+    max_position_pct: float = field(default_factory=lambda: float(os.getenv("MAX_POSITION_PCT", "0.25")))
+    min_reward_risk: float = field(default_factory=lambda: float(os.getenv("MIN_REWARD_RISK", "1.2")))
     min_dollar_volume: float = field(default_factory=lambda: float(os.getenv("MIN_DOLLAR_VOLUME", "1000000")))
     lookback_days: int = field(default_factory=lambda: int(os.getenv("LOOKBACK_DAYS", "80")))
     dashboard_host: str = field(default_factory=lambda: os.getenv("DASHBOARD_HOST", "0.0.0.0"))
@@ -104,6 +104,10 @@ class Settings:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.data_dir / "tradebot.db"
         self.demo_state_path = self.data_dir / "demo_broker.json"
+
+    @property
+    def is_small_account(self) -> bool:
+        return self.max_total_capital > 0 and self.max_total_capital < 2000
 
     @property
     def is_demo(self) -> bool:
