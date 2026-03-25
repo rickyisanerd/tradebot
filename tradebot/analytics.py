@@ -62,6 +62,15 @@ def compute_metrics(bars: List[dict]) -> Dict[str, float]:
     atr_value = atr(highs, lows, closes, 14)
     atr_pct = (atr_value / latest) * 100 if latest else 0.0
     avg_dollar_volume = mean([c * v for c, v in zip(closes[-20:], volumes[-20:])]) if closes else 0.0
+    avg_volume_20 = mean(volumes[-20:]) if len(volumes) >= 20 else mean(volumes) if volumes else 1.0
+    latest_volume = volumes[-1] if volumes else 0.0
+    volume_ratio = latest_volume / max(1.0, avg_volume_20)
+    if len(bars) >= 2:
+        prev_close = float(bars[-2]["c"])
+        current_open = float(bars[-1]["o"])
+        gap_pct = ((current_open - prev_close) / prev_close) * 100 if prev_close else 0.0
+    else:
+        gap_pct = 0.0
     metrics = {
         "latest": latest,
         "sma10": sma(closes, 10),
@@ -76,6 +85,9 @@ def compute_metrics(bars: List[dict]) -> Dict[str, float]:
         "avg_dollar_volume": avg_dollar_volume,
         "swing_high20": max(closes[-20:]) if len(closes) >= 20 else max(closes),
         "swing_low20": min(closes[-20:]) if len(closes) >= 20 else min(closes),
+        "volume_ratio": volume_ratio,
+        "avg_volume_20": avg_volume_20,
+        "gap_pct": gap_pct,
     }
     return metrics
 
@@ -95,6 +107,23 @@ def analyze_momentum(metrics: Dict[str, float]) -> Tuple[float, List[str]]:
     if metrics["momentum5"] < -3:
         score -= 10
         reasons.append("recent pullback is sharper than comfy")
+    volume_ratio = metrics.get("volume_ratio", 1.0)
+    if volume_ratio >= 2.0:
+        score += 15
+        reasons.append("volume spike suggests institutional interest or catalyst")
+    elif volume_ratio >= 1.5:
+        score += 8
+        reasons.append("above average volume adds conviction")
+    gap_pct = metrics.get("gap_pct", 0.0)
+    if 1.0 <= gap_pct <= 5.0:
+        score += 10
+        reasons.append("positive gap up signals overnight demand")
+    elif gap_pct > 8.0:
+        score -= 5
+        reasons.append("gap may be overextended for a safe entry")
+    elif gap_pct < -3.0:
+        score -= 8
+        reasons.append("gap down suggests negative sentiment")
     return max(0.0, min(100.0, score)), reasons
 
 

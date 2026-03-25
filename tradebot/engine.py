@@ -448,19 +448,29 @@ class TradingEngine:
         reasons.extend(reversion_reasons[:2])
         reasons.extend(risk_reasons[:2])
 
+        # Small-account overrides for entry thresholds and sizing
+        if self.settings.is_small_account:
+            min_reward_risk = min(self.settings.min_reward_risk, 1.2)
+            risk_per_trade_pct = max(self.settings.risk_per_trade_pct, 0.04)
+            max_position_pct = max(self.settings.max_position_pct, 0.25)
+        else:
+            min_reward_risk = self.settings.min_reward_risk
+            risk_per_trade_pct = self.settings.risk_per_trade_pct
+            max_position_pct = self.settings.max_position_pct
+
         action = "watch"
         if (
-            final_score >= 60
-            and reward_risk >= self.settings.min_reward_risk
+            final_score >= 55
+            and reward_risk >= min_reward_risk
             and metrics["avg_dollar_volume"] >= self.settings.min_dollar_volume
             and risk_score >= 45
-            and decision_support_score >= 50
+            and decision_support_score >= 40
         ):
             action = "buy"
             reasons.insert(0, "decision support, liquidity, and reward/risk all cleared the bar")
 
-        risk_budget = max(50.0, buying_power * self.settings.risk_per_trade_pct)
-        position_cap = max(100.0, buying_power * self.settings.max_position_pct)
+        risk_budget = max(50.0, buying_power * risk_per_trade_pct)
+        position_cap = max(100.0, buying_power * max_position_pct)
         qty_from_risk = int(risk_budget / risk)
         qty_from_value = int(position_cap / price)
         qty = max(0, min(qty_from_risk, qty_from_value))
@@ -639,6 +649,12 @@ class TradingEngine:
             note = ""
             held_days = self._held_days(str(meta["opened_at"]))
             effective_stop_price = self._loss_stop_price(float(meta["entry_price"]), float(meta["stop_price"]))
+            # Trailing stop: ratchet the stop up as the stock moves higher
+            trail_pct = max(self.settings.stop_loss_pct, 0.08)
+            trailing_stop = current * (1 - trail_pct)
+            if trailing_stop > effective_stop_price:
+                effective_stop_price = trailing_stop
+                self.db.update_stop_price(position.symbol, trailing_stop)
             if current <= effective_stop_price:
                 should_sell = True
                 note = "stop hit"
@@ -712,6 +728,15 @@ class TradingEngine:
         deployed_capital = sum(p.market_value for p in positions)
         capital_limit = self.settings.max_total_capital if self.settings.max_total_capital > 0 else max(account.equity, deployed_capital + cash_left)
         capital_left = max(0.0, capital_limit - deployed_capital)
+        # Dynamic equity-based position sizing
+        if self.settings.is_small_account:
+            effective_risk_per_trade_pct = max(self.settings.risk_per_trade_pct, 0.04)
+            effective_max_position_pct = max(self.settings.max_position_pct, 0.25)
+        else:
+            effective_risk_per_trade_pct = self.settings.risk_per_trade_pct
+            effective_max_position_pct = self.settings.max_position_pct
+        risk_budget = max(50.0, account.equity * effective_risk_per_trade_pct)
+        position_cap = max(100.0, account.equity * effective_max_position_pct)
         for candidate in candidates:
             if slots <= 0:
                 break
@@ -743,7 +768,30 @@ class TradingEngine:
             slots -= 1
         return bought
 
+    def _auto_scale_limits(self) -> None:
+        """Scale position limits up as account equity grows."""
+        if not self.settings.max_total_capital or self.settings.max_total_capital <= 0:
+            return
+        try:
+            account = self.broker.account()
+        except Exception:
+            return
+        equity = account.equity
+        if equity >= 10000 and self.settings.max_total_capital < 10000:
+            self.settings.max_total_capital = 10000
+            self.settings.max_open_positions = max(self.settings.max_open_positions, 8)
+        elif equity >= 5000 and self.settings.max_total_capital < 5000:
+            self.settings.max_total_capital = 5000
+            self.settings.max_open_positions = max(self.settings.max_open_positions, 7)
+        elif equity >= 2500 and self.settings.max_total_capital < 2500:
+            self.settings.max_total_capital = 2500
+            self.settings.max_open_positions = max(self.settings.max_open_positions, 6)
+        elif equity >= 1000 and self.settings.max_total_capital < 1000:
+            self.settings.max_total_capital = 1000
+            self.settings.max_open_positions = max(self.settings.max_open_positions, 5)
+
     def trade_once(self) -> Dict[str, List[dict]]:
+        self._auto_scale_limits()
         self.broker.advance_market()
         sold = self.manage_positions()
         candidates = self.scan_market()

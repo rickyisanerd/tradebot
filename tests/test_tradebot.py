@@ -20,6 +20,14 @@ from tradebot.sec import SecTracker
 def make_settings(tmp_path: Path) -> Settings:
     settings = Settings(data_dir=tmp_path)
     settings.broker_mode = "demo"
+    # Pin values that changed in the small-account enhancement so existing
+    # deterministic tests stay stable against the demo simulator.
+    settings.max_total_capital = 0
+    settings.max_open_positions = 0
+    settings.risk_per_trade_pct = 0.01
+    settings.max_position_pct = 0.10
+    settings.min_reward_risk = 1.8
+    settings.starting_cash = 100_000
     settings.__post_init__()
     return settings
 
