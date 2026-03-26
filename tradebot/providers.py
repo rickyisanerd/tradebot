@@ -89,7 +89,7 @@ class DemoBroker(BaseBroker):
         self._save(state)
 
     def _base_price(self, symbol: str) -> float:
-        return 4.0 + (sum(ord(c) for c in symbol) % 1400) / 100.0
+        return 2.5 + (sum(ord(c) for c in symbol) % 700) / 100.0
 
     def _bars_for_symbol(self, symbol: str, days: int, tick: int) -> List[dict]:
         rng = random.Random(f"{self.settings.demo_seed}:{symbol}:{tick}")
@@ -101,7 +101,7 @@ class DemoBroker(BaseBroker):
         for offset in range(days, 0, -1):
             drift = trend + season + math.sin((days - offset) / 6.0) / 500.0
             shock = rng.gauss(0, 0.025)
-            price = max(1.5, min(19.75, price * (1 + drift + shock)))
+            price = max(1.5, min(9.90, price * (1 + drift + shock)))
             high = price * (1 + abs(rng.gauss(0.015, 0.01)))
             low = price * max(0.86, 1 - abs(rng.gauss(0.015, 0.01)))
             open_ = max(low, min(high, price * (1 + rng.gauss(0, 0.01))))
