@@ -634,13 +634,18 @@ class Database:
                     continue
                 wins = row["wins"] + (1 if pnl_pct > 0 else 0)
                 losses = row["losses"] + (1 if pnl_pct <= 0 else 0)
-                # Keep learning responsive to outcome quality without letting one outlier
-                # trade pin every strategy to the floor or ceiling.
-                bounded_pnl = max(-20.0, min(20.0, float(pnl_pct)))
+                # Adaptive learning: strategies that consistently pick winners
+                # get boosted faster; losers decay faster.  Wider bounds let the
+                # bot express stronger conviction once it has enough data.
+                bounded_pnl = max(-25.0, min(25.0, float(pnl_pct)))
                 contribution = (bounded_pnl / 20.0) * (float(score) / 100.0)
                 total_return = row["total_return"] + contribution
-                weight = 1.0 + (wins - losses) * 0.05 + total_return * 0.30
-                weight = max(0.4, min(2.2, weight))
+                total_trades = wins + losses
+                # Scale the per-trade delta up once we have enough history so
+                # early noise doesn't over-steer, but mature weights move faster.
+                maturity_factor = min(1.5, 0.8 + total_trades * 0.02)
+                weight = 1.0 + (wins - losses) * 0.08 * maturity_factor + total_return * 0.35
+                weight = max(0.25, min(3.0, weight))
                 con.execute(
                     """
                     UPDATE learning

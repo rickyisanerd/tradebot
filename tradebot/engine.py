@@ -356,17 +356,20 @@ class TradingEngine:
         if self.settings.scan_universe or not self.settings.is_alpaca:
             return raw_symbols[: self.settings.scan_limit]
 
-        target_pool = max(self.settings.scan_limit * 4, self.settings.candidate_limit * 6)
-        batch_size = max(25, min(60, self.settings.scan_limit * 2))
+        # Scan the full Alpaca universe to find all stocks under $10 with
+        # adequate liquidity, rather than stopping after a small fixed number
+        # of batches.
+        target_pool = max(self.settings.scan_limit * 4, self.settings.candidate_limit * 8)
+        batch_size = max(40, min(100, self.settings.scan_limit))
         history_days = min(max(30, self.settings.lookback_days // 3), self.settings.lookback_days)
         baseline_liquidity = max(100_000.0, self.settings.min_dollar_volume * 0.5)
         ranked: List[tuple[float, str]] = []
         seen: set[str] = set()
-        max_batches = 4
+        # Allow enough batches to cover the full universe (typically ~10k symbols
+        # from Alpaca, yielding hundreds of sub-$10 candidates).
+        max_symbols_to_screen = min(len(raw_symbols), 3000)
 
-        for start in range(0, len(raw_symbols), batch_size):
-            if start >= batch_size * max_batches:
-                break
+        for start in range(0, max_symbols_to_screen, batch_size):
             batch = raw_symbols[start : start + batch_size]
             if not batch:
                 break
@@ -388,7 +391,8 @@ class TradingEngine:
                     continue
                 ranked.append((avg_dollar_volume, symbol))
                 seen.add(symbol)
-            if len(ranked) >= target_pool:
+            # Once we have plenty of qualifying symbols, stop screening
+            if len(ranked) >= target_pool * 2:
                 break
 
         if ranked:
