@@ -552,6 +552,18 @@ class Database:
                 (utc_now(), symbol, side, qty, price, status, note, pnl_pct, json.dumps(analysis or {})),
             )
 
+    def recover_analysis_for_symbol(self, symbol: str) -> Dict[str, float]:
+        """Try to find analyst_scores from a previous buy trade event for this symbol."""
+        with self.connect() as con:
+            row = con.execute(
+                "SELECT analysis_json FROM trade_events WHERE symbol = ? AND side = 'buy' "
+                "AND analysis_json != '{}' ORDER BY created_at DESC LIMIT 1",
+                (symbol,),
+            ).fetchone()
+            if row:
+                return json.loads(row["analysis_json"] or "{}")
+            return {}
+
     def open_position_meta(
         self,
         symbol: str,

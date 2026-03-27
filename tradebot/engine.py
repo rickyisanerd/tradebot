@@ -722,7 +722,9 @@ class TradingEngine:
             if not meta:
                 stop_price = round(max(position.avg_entry_price * (1 - self.settings.stop_loss_pct), self.settings.min_stock_price * 0.5), 2)
                 target_price = round(position.avg_entry_price + (position.avg_entry_price - stop_price) * self.settings.min_reward_risk, 2)
-                self.db.open_position_meta(symbol, position.qty, position.avg_entry_price, stop_price, target_price, {})
+                # Try to recover analyst_scores from the original buy trade event
+                recovered_analysis = self.db.recover_analysis_for_symbol(symbol)
+                self.db.open_position_meta(symbol, position.qty, position.avg_entry_price, stop_price, target_price, recovered_analysis)
                 self.db.record_trade(symbol, "buy", position.qty, position.avg_entry_price, "reconciled", "reconciled external position")
                 notes.append({"symbol": symbol, "note": "reconciled external position"})
                 continue
@@ -812,35 +814,31 @@ class TradingEngine:
                 status = result.get("status", "submitted")
                 recorded_qty = float(raw_qty) if raw_qty not in (None, "") else float(position.qty)
                 recorded_price = float(raw_price) if raw_price not in (None, "") else float(current)
-                if status in {"filled"}:
-                    closed = self.db.close_position_meta(position.symbol)
-                    entry = float(closed["entry_price"]) if closed else position.avg_entry_price
-                    pnl_pct = ((recorded_price - entry) / entry) * 100 if entry else 0.0
-                    analysis = closed["analysis"] if closed else {}
-                    self.db.record_trade(
-                        position.symbol,
-                        "sell",
-                        recorded_qty,
-                        recorded_price,
-                        status,
-                        note,
-                        pnl_pct,
-                        analysis,
-                    )
-                    if analysis:
-                        self.db.update_learning(analysis, pnl_pct)
-                    sold.append({"symbol": position.symbol, "pnl_pct": round(pnl_pct, 2), "note": note})
+                # Alpaca usually returns "submitted" / "pending_new" rather
+                # than "filled" synchronously.  Close the position meta and
+                # update learning immediately so weights don't stall.  The
+                # reconciliation path will catch any edge cases.
+                closed = self.db.close_position_meta(position.symbol)
+                entry = float(closed["entry_price"]) if closed else position.avg_entry_price
+                pnl_pct = ((recorded_price - entry) / entry) * 100 if entry else 0.0
+                analysis = closed["analysis"] if closed else {}
+                effective_status = "filled" if status in {"filled", "submitted", "pending_new", "accepted"} else status
+                self.db.record_trade(
+                    position.symbol,
+                    "sell",
+                    recorded_qty,
+                    recorded_price,
+                    effective_status,
+                    note,
+                    pnl_pct,
+                    analysis,
+                )
+                if analysis:
+                    self.db.update_learning(analysis, pnl_pct)
+                    log.info("Learning updated for %s: pnl=%.2f%% analysis=%s", position.symbol, pnl_pct, analysis)
                 else:
-                    self.db.set_exit_pending(position.symbol, True)
-                    self.db.record_trade(
-                        position.symbol,
-                        "sell",
-                        recorded_qty,
-                        recorded_price,
-                        status,
-                        note,
-                    )
-                    sold.append({"symbol": position.symbol, "note": f"{note} submitted"})
+                    log.warning("No analysis stored for %s — learning skipped", position.symbol)
+                sold.append({"symbol": position.symbol, "pnl_pct": round(pnl_pct, 2), "note": note})
         return sold
 
     def buy_candidates(self, candidates: List[Candidate]) -> List[dict]:
@@ -919,9 +917,60 @@ class TradingEngine:
             self.settings.max_total_capital = 1000
             self.settings.max_open_positions = max(self.settings.max_open_positions, 5)
 
+    # ------------------------------------------------------------------
+    # Retroactive scan learning: check how past scan picks performed
+    # and feed the outcome back into the learning weights, even for
+    # stocks we only watched but didn't buy.
+    # ------------------------------------------------------------------
+    def _retroactive_scan_learning(self) -> int:
+        """Review the last scan's 'buy' picks that we did NOT purchase.
+        Fetch their current price and compare to the scan price.  Treat
+        the simulated P&L as a learning signal so the weights evolve
+        faster — even between actual trades."""
+        scans = self.db.latest_candidates()
+        if not scans:
+            return 0
+        # Only evaluate buy candidates that are NOT in our current positions
+        held = {p.symbol for p in self.broker.positions()}
+        review = [
+            c for c in scans
+            if c.get("action") == "buy"
+            and c.get("symbol") not in held
+            and c.get("analyst_scores")
+        ]
+        if not review:
+            return 0
+        symbols = [c["symbol"] for c in review]
+        try:
+            prices = self.broker.latest_prices(symbols)
+        except Exception:  # noqa: BLE001
+            return 0
+        updated = 0
+        for candidate in review:
+            sym = candidate["symbol"]
+            scan_price = candidate.get("price", 0)
+            current = prices.get(sym, 0)
+            if not scan_price or not current:
+                continue
+            sim_pnl_pct = ((current - scan_price) / scan_price) * 100
+            # Dampen the signal — this is simulated, not a real trade
+            dampened_pnl = sim_pnl_pct * 0.4
+            analysis = candidate["analyst_scores"]
+            self.db.update_learning(analysis, dampened_pnl)
+            updated += 1
+            log.info(
+                "Retroactive learning for %s: scan=%.2f now=%.2f sim_pnl=%.2f%% (dampened=%.2f%%)",
+                sym, scan_price, current, sim_pnl_pct, dampened_pnl,
+            )
+        return updated
+
     def trade_once(self) -> Dict[str, List[dict]]:
         self._auto_scale_limits()
         self.broker.advance_market()
+        # Learn from previous scan picks before making new decisions
+        retro_count = self._retroactive_scan_learning()
+        if retro_count:
+            log.info("Retroactive learning applied to %d past scan picks", retro_count)
         sold = self.manage_positions()
         candidates = self.scan_market()
         bought = self.buy_candidates(candidates)

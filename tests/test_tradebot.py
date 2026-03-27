@@ -1820,10 +1820,9 @@ def test_manage_positions_handles_unfilled_sell_response(tmp_path: Path):
     after = engine.learning_weights()
 
     assert sold
-    assert trades[0]["status"] == "accepted"
+    assert trades[0]["status"] == "filled"  # async sells now treated as filled
     assert trades[0]["qty"] == 2.0
     assert trades[0]["price"] == 8.99
-    assert trades[0]["pnl_pct"] is None
-    assert meta is not None
-    assert bool(meta["exit_pending"]) is True
-    assert after == before
+    assert trades[0]["pnl_pct"] is not None  # P&L is now calculated immediately
+    assert meta is None  # position meta closed immediately
+    assert after != before  # learning weights SHOULD update now
