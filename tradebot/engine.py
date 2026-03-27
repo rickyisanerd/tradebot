@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional
 
+import logging
+
 from .analytics import compute_metrics
 from .congress import CongressTracker
 from .config import Settings
@@ -12,8 +14,11 @@ from .db import Database
 from .earnings import EarningsTracker
 from .macro import MacroTracker
 from .models import Candidate
+from .polygon import PolygonClient, build_polygon_client
 from .providers import BaseBroker, ProviderError
 from .sec import SecTracker
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -21,6 +26,11 @@ class TradingEngine:
     settings: Settings
     broker: BaseBroker
     db: Database
+    polygon: Optional[PolygonClient] = None
+
+    def __post_init__(self) -> None:
+        if self.polygon is None:
+            self.polygon = build_polygon_client(self.settings)
 
     def learning_weights(self) -> Dict[str, float]:
         raw = self.db.learning_weights()
@@ -50,7 +60,35 @@ class TradingEngine:
                 return pause_until
         return None
 
+    def _market_is_closed(self) -> bool:
+        """Check if the US stock market is currently closed.
+
+        Uses Polygon /v1/marketstatus/now when available, otherwise uses
+        a simple Eastern-time schedule heuristic.
+        """
+        if self.polygon:
+            try:
+                status = self.polygon.market_status()
+                market_state = str(status.get("market", "")).lower()
+                return market_state != "open"
+            except Exception:  # noqa: BLE001
+                pass
+        # Heuristic fallback: market open 9:30-16:00 ET, weekdays only
+        from datetime import time as dt_time
+
+        now_utc = datetime.now(timezone.utc)
+        # Approximate ET as UTC-4 (EDT) — close enough for gating
+        et_offset = timezone(timedelta(hours=-4))
+        now_et = now_utc.astimezone(et_offset)
+        if now_et.weekday() >= 5:  # Saturday=5, Sunday=6
+            return True
+        market_open = dt_time(9, 30)
+        market_close = dt_time(16, 0)
+        return not (market_open <= now_et.time() <= market_close)
+
     def _buying_pause_reason(self) -> str:
+        if self._market_is_closed():
+            return "market is currently closed — orders will be queued for next market open"
         pause_until = self._pdt_pause_until()
         if pause_until is None:
             return ""
@@ -239,12 +277,40 @@ class TradingEngine:
         self.db.record_signal_refresh_event(source, "ok", records_count=len(records), failure_count=0)
         return records
 
+    def _short_volume_signal(self, symbol: str) -> Dict[str, float]:
+        """Fetch short-volume ratio from Polygon for squeeze detection."""
+        if not self.polygon or not self.settings.short_volume_signal_enabled:
+            return {
+                "short_volume_ratio": 0.0,
+                "short_volume_available": 0.0,
+            }
+        try:
+            records = self.polygon.short_volume(symbol, days=5)
+        except Exception:  # noqa: BLE001
+            return {
+                "short_volume_ratio": 0.0,
+                "short_volume_available": 0.0,
+            }
+        if not records:
+            return {
+                "short_volume_ratio": 0.0,
+                "short_volume_available": 0.0,
+            }
+        # Average the short volume ratio over recent days
+        ratios = [float(r.get("short_volume_ratio", 0)) for r in records if r.get("short_volume_ratio")]
+        avg_ratio = sum(ratios) / len(ratios) if ratios else 0.0
+        return {
+            "short_volume_ratio": avg_ratio,
+            "short_volume_available": 1.0,
+        }
+
     def _external_decision_inputs(self, symbol: str) -> Dict[str, float]:
         return (
             self.db.congress_signal_for_symbol(symbol, self.settings.congress_signal_window_days)
             | self.db.sec_signal_for_symbol(symbol, self.settings.sec_signal_window_days)
             | self.db.earnings_signal_for_symbol(symbol, self.settings.earnings_signal_window_days)
             | self.db.macro_signal(self.settings.macro_signal_window_days)
+            | self._short_volume_signal(symbol)
         )
 
     def _external_signal_controls(self, symbol: str) -> tuple[Dict[str, float], Dict[str, str]]:
@@ -351,22 +417,49 @@ class TradingEngine:
             return 0.0
         return sum(float(bar["c"]) * float(bar["v"]) for bar in recent) / len(recent)
 
+    def _polygon_universe(self) -> List[str] | None:
+        """Use Polygon daily market summary to discover ALL sub-$10 stocks
+        in a single API call.  Returns None if Polygon is unavailable."""
+        if not self.polygon:
+            return None
+        try:
+            items = self.polygon.sub10_universe(
+                min_price=self.settings.min_stock_price,
+                max_price=self.settings.max_stock_price,
+                min_volume=200_000,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Polygon universe discovery failed, falling back to broker: %s", exc)
+            return None
+        if not items:
+            return None
+        target_pool = max(self.settings.scan_limit * 4, self.settings.candidate_limit * 8)
+        symbols = [item["symbol"] for item in items[:target_pool]]
+        log.info("Polygon discovered %d sub-$10 stocks (using top %d)", len(items), len(symbols))
+        return symbols
+
     def _candidate_symbol_pool(self) -> List[str]:
+        # If user specified a custom universe, honour it.
+        if self.settings.scan_universe:
+            return self.settings.scan_universe[: self.settings.scan_limit]
+
+        # Try Polygon first — one API call covers the entire market.
+        polygon_symbols = self._polygon_universe()
+        if polygon_symbols:
+            return polygon_symbols
+
+        # Non-Alpaca (demo) mode without Polygon — use hardcoded universe.
         raw_symbols = self.broker.universe()
-        if self.settings.scan_universe or not self.settings.is_alpaca:
+        if not self.settings.is_alpaca:
             return raw_symbols[: self.settings.scan_limit]
 
-        # Scan the full Alpaca universe to find all stocks under $10 with
-        # adequate liquidity, rather than stopping after a small fixed number
-        # of batches.
+        # Fallback: scan Alpaca universe in batches.
         target_pool = max(self.settings.scan_limit * 4, self.settings.candidate_limit * 8)
         batch_size = max(40, min(100, self.settings.scan_limit))
         history_days = min(max(30, self.settings.lookback_days // 3), self.settings.lookback_days)
         baseline_liquidity = max(100_000.0, self.settings.min_dollar_volume * 0.5)
         ranked: List[tuple[float, str]] = []
         seen: set[str] = set()
-        # Allow enough batches to cover the full universe (typically ~10k symbols
-        # from Alpaca, yielding hundreds of sub-$10 candidates).
         max_symbols_to_screen = min(len(raw_symbols), 3000)
 
         for start in range(0, max_symbols_to_screen, batch_size):
@@ -391,7 +484,6 @@ class TradingEngine:
                     continue
                 ranked.append((avg_dollar_volume, symbol))
                 seen.add(symbol)
-            # Once we have plenty of qualifying symbols, stop screening
             if len(ranked) >= target_pool * 2:
                 break
 
@@ -430,6 +522,8 @@ class TradingEngine:
             }
         )
         analysis_input.update(external_inputs)
+        # Inject short volume weight for the scoring model
+        analysis_input["short_volume_weight"] = self.settings.decision_support_short_volume_weight
         analysis = analyze_with_mcp(analysis_input, self.settings.analyzer_mode)
         decision_support_score, decision_support_reasons = analysis["decision_support"]
         momentum_score, momentum_reasons = analysis["momentum"]
@@ -562,7 +656,7 @@ class TradingEngine:
 
     def refresh_macro_events(self) -> List[dict]:
         def run() -> List[dict]:
-            tracker = MacroTracker(self.settings)
+            tracker = MacroTracker(self.settings, polygon_client=self.polygon)
             events = [event.__dict__ for event in tracker.refresh()]
             self.db.replace_macro_events(events)
             return events
@@ -829,4 +923,6 @@ class TradingEngine:
             "buying_paused_reason": self._buying_pause_reason(),
             "mode": self.settings.broker_mode,
             "provider": self.broker.name,
+            "polygon_enabled": self.polygon is not None,
+            "market_closed": self._market_is_closed(),
         }

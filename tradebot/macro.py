@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Optional
 
 import requests
 
 from .config import Settings
+
+log = logging.getLogger(__name__)
 
 
 class MacroTrackerError(RuntimeError):
@@ -41,8 +44,9 @@ class MacroTracker:
         r'fomc-meeting__date[^>]*>\s*(\d{1,2})(?:\s*-\s*(\d{1,2}))?\s*\*?'
     )
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, polygon_client: Optional[object] = None) -> None:
         self.settings = settings
+        self._polygon = polygon_client
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -59,7 +63,53 @@ class MacroTracker:
         fomc = self._fetch_fomc()
         return self._dedupe(cpi + fomc)
 
+    def _fetch_cpi_from_polygon(self) -> List[MacroEvent]:
+        """Use Polygon /fed/v1/inflation API for CPI data.
+
+        The inflation endpoint returns monthly observations with CPI values.
+        We use the observation dates as approximate CPI release dates.
+        """
+        if not self._polygon:
+            return []
+        try:
+            records = self._polygon.inflation_data(limit=12)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Polygon inflation API failed: %s", exc)
+            return []
+        events: List[MacroEvent] = []
+        today = datetime.now(timezone.utc).date()
+        for record in records:
+            date_str = record.get("date")
+            if not date_str:
+                continue
+            try:
+                # Polygon returns the observation month (e.g. 2026-02-01).
+                # CPI is typically released ~2 weeks into the following month.
+                obs_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+                # Approximate CPI release: 13th of the month after observation
+                if obs_date.month == 12:
+                    release_date = obs_date.replace(year=obs_date.year + 1, month=1, day=13)
+                else:
+                    release_date = obs_date.replace(month=obs_date.month + 1, day=13)
+            except ValueError:
+                continue
+            if release_date < today:
+                continue
+            events.append(
+                MacroEvent(
+                    event_type="cpi",
+                    event_date=release_date.isoformat(),
+                    source="polygon.io/fed/v1/inflation",
+                )
+            )
+        return events
+
     def _fetch_cpi(self) -> List[MacroEvent]:
+        # Try Polygon first (reliable API), fall back to web scraping
+        polygon_events = self._fetch_cpi_from_polygon()
+        if polygon_events:
+            return polygon_events
+
         html = self._get_text(self._CPI_URL)
         events: List[MacroEvent] = []
         today = datetime.now(timezone.utc).date()
