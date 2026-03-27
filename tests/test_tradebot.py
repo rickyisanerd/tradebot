@@ -766,7 +766,7 @@ def test_refresh_macro_events_stores_global_signal_inputs(tmp_path: Path) -> Non
     engine = TradingEngine(settings=settings, broker=build_broker(settings), db=db)
 
     class FakeMacroTracker:
-        def __init__(self, _settings) -> None:
+        def __init__(self, _settings, **kwargs) -> None:
             pass
 
         def refresh(self):

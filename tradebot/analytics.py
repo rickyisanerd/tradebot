@@ -273,6 +273,22 @@ def analyze_decision_support(metrics: Dict[str, float]) -> Tuple[float, List[str
             if earnings_weight > 0:
                 reasons.append("earnings are close enough to keep position sizing honest")
 
+    # --- Short volume / squeeze signal ---
+    short_volume_ratio = metrics.get("short_volume_ratio", 0.0)
+    short_volume_available = metrics.get("short_volume_available", 0.0)
+    short_volume_weight = max(0.0, metrics.get("short_volume_weight", 1.0))
+    if short_volume_available > 0 and short_volume_weight > 0:
+        if short_volume_ratio >= 50:
+            # Heavy shorting (>50% of volume) — potential squeeze setup
+            score += min(12, (short_volume_ratio - 45) * 0.8) * short_volume_weight
+            reasons.append("high short volume ratio suggests squeeze potential")
+        elif short_volume_ratio >= 40:
+            score += 4 * short_volume_weight
+            reasons.append("elevated short interest adds speculative upside")
+        elif short_volume_ratio < 20 and short_volume_ratio > 0:
+            score -= 3 * short_volume_weight
+            reasons.append("low short interest means less squeeze catalyst")
+
     has_near_macro_event = metrics.get("has_near_macro_event", 0.0)
     days_until_macro_event = metrics.get("days_until_macro_event", 999.0)
     near_fomc_count = metrics.get("near_fomc_count", 0.0)
