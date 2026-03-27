@@ -433,7 +433,9 @@ class TradingEngine:
             return None
         if not items:
             return None
-        target_pool = max(self.settings.scan_limit * 4, self.settings.candidate_limit * 8)
+        # Cap the pool — Polygon bars_batch fetches one ticker at a time,
+        # so keep this reasonable to avoid rate limits and slow scans.
+        target_pool = max(self.settings.scan_limit, self.settings.candidate_limit * 4)
         symbols = [item["symbol"] for item in items[:target_pool]]
         log.info("Polygon discovered %d sub-$10 stocks (using top %d)", len(items), len(symbols))
         return symbols
@@ -596,12 +598,41 @@ class TradingEngine:
             signal_usage=signal_usage,
         )
 
+    def _fetch_bars(self, symbols: List[str], days: int) -> Dict[str, List[dict]]:
+        """Fetch historical bars, using Polygon when available and batching
+        large symbol lists so we don't exceed URL-length limits."""
+        # Prefer Polygon for bar data when configured — avoids Alpaca
+        # URL-length limit when Polygon discovered hundreds of symbols.
+        if self.polygon:
+            try:
+                return self.polygon.bars_batch(symbols, days)
+            except Exception:  # noqa: BLE001
+                log.warning("Polygon bars_batch failed, falling back to broker")
+
+        # Alpaca (and others) choke on huge symbol lists in a single call.
+        # Split into batches of 100 to stay within URL-length limits.
+        batch_size = 100
+        all_bars: Dict[str, List[dict]] = {}
+        for start in range(0, len(symbols), batch_size):
+            batch = symbols[start : start + batch_size]
+            try:
+                result = self.broker.bars(batch, days)
+                all_bars.update(result)
+            except ProviderError:
+                log.warning("Broker bars batch failed for %d symbols starting at offset %d", len(batch), start)
+                continue
+        return all_bars
+
     def scan_market(self) -> List[Candidate]:
         try:
             account = self.broker.account()
             symbols = self._candidate_symbol_pool()
-            bars = self.broker.bars(symbols, self.settings.lookback_days)
         except ProviderError:
+            self.db.record_scan(self.settings.broker_mode, self.broker.name, [])
+            return []
+        bars = self._fetch_bars(symbols, self.settings.lookback_days)
+        if not bars:
+            log.warning("No bar data returned for %d symbols", len(symbols))
             self.db.record_scan(self.settings.broker_mode, self.broker.name, [])
             return []
         candidates: List[Candidate] = []

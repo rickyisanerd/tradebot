@@ -221,15 +221,25 @@ class PolygonClient:
         return bars
 
     def bars_batch(self, tickers: List[str], days: int = 80) -> Dict[str, List[dict]]:
-        """Fetch bars for multiple tickers."""
+        """Fetch bars for multiple tickers using concurrent requests."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         out: Dict[str, List[dict]] = {}
-        for ticker in tickers:
-            try:
-                result = self.bars(ticker, days)
-                if result:
-                    out[ticker] = result
-            except RuntimeError:
-                continue
+
+        def _fetch_one(ticker: str) -> tuple[str, List[dict]]:
+            return ticker, self.bars(ticker, days)
+
+        # Use up to 8 threads to speed up fetching while respecting rate limits
+        max_workers = min(8, len(tickers))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_fetch_one, t): t for t in tickers}
+            for future in as_completed(futures):
+                try:
+                    ticker, result = future.result()
+                    if result:
+                        out[ticker] = result
+                except Exception:  # noqa: BLE001
+                    continue
         return out
 
 
