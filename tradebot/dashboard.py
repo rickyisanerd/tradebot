@@ -203,12 +203,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/send-report")
     async def send_report():
         """Manually trigger a daily report email."""
+        import asyncio
         if not email_configured():
             return JSONResponse({"ok": False, "error": "Email not configured. Set GMAIL_APP_PASSWORD on Railway."}, status_code=400)
-        success = reporter.send_now()
-        if success:
-            return JSONResponse({"ok": True, "message": "Report emailed!"})
-        return JSONResponse({"ok": False, "error": "Failed to send — check logs"}, status_code=500)
+        try:
+            success = await asyncio.get_event_loop().run_in_executor(None, reporter.send_now)
+            if success:
+                return JSONResponse({"ok": True, "message": "Report emailed!"})
+            return JSONResponse({"ok": False, "error": "Failed to send — check GMAIL_APP_PASSWORD and logs"}, status_code=500)
+        except Exception as e:
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
     @app.get("/api/status")
     async def status():

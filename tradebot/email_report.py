@@ -281,13 +281,23 @@ def send_daily_report(snapshot: Dict[str, Any]) -> bool:
     msg.attach(MIMEText(plain, "plain"))
     msg.attach(MIMEText(html, "html"))
 
-    try:
-        with smtplib.SMTP("smtp.gmail.com", 587) as server:
-            server.starttls()
-            server.login(sender, password)
-            server.send_message(msg)
-        log.info(f"Daily report emailed to {recipient}")
-        return True
-    except Exception as e:
-        log.error(f"Failed to send daily report email: {e}")
-        return False
+    # Try STARTTLS (587) first, then SSL (465) as fallback
+    for method, port in [("starttls", 587), ("ssl", 465)]:
+        try:
+            if method == "starttls":
+                with smtplib.SMTP("smtp.gmail.com", port, timeout=15) as server:
+                    server.starttls()
+                    server.login(sender, password)
+                    server.send_message(msg)
+            else:
+                with smtplib.SMTP_SSL("smtp.gmail.com", port, timeout=15) as server:
+                    server.login(sender, password)
+                    server.send_message(msg)
+            log.info(f"Daily report emailed to {recipient} via {method}:{port}")
+            return True
+        except Exception as e:
+            log.warning(f"Email send failed via {method}:{port}: {e}")
+            continue
+
+    log.error(f"Failed to send daily report email — both SMTP methods failed")
+    return False
