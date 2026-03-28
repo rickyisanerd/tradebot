@@ -1,13 +1,12 @@
-"""Daily email report sent at market close."""
+"""Daily email report sent at market close via Resend API."""
 from __future__ import annotations
 
 import logging
-import smtplib
 import os
 from datetime import datetime, timezone
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from typing import Any, Dict, List, Optional
+
+import requests as http_requests
 
 log = logging.getLogger(__name__)
 
@@ -17,7 +16,7 @@ def _env(name: str, default: str = "") -> str:
 
 
 def email_configured() -> bool:
-    return bool(_env("GMAIL_APP_PASSWORD") and _env("REPORT_EMAIL", "rickyisanerd@gmail.com"))
+    return bool(_env("RESEND_API_KEY") and _env("REPORT_EMAIL", "rickyisanerd@gmail.com"))
 
 
 def _compute_daily_pnl(positions: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -254,13 +253,13 @@ def build_report_html(snapshot: Dict[str, Any]) -> str:
 
 
 def send_daily_report(snapshot: Dict[str, Any]) -> bool:
-    """Send the daily market-close email. Returns True on success."""
+    """Send the daily market-close email via Resend API. Returns True on success."""
     recipient = _env("REPORT_EMAIL", "rickyisanerd@gmail.com")
-    sender = _env("REPORT_SENDER_EMAIL", recipient)
-    password = _env("GMAIL_APP_PASSWORD")
+    sender = _env("REPORT_SENDER_EMAIL", "TradeBot <onboarding@resend.dev>")
+    api_key = _env("RESEND_API_KEY")
 
-    if not password:
-        log.warning("GMAIL_APP_PASSWORD not set — skipping daily email report")
+    if not api_key:
+        log.warning("RESEND_API_KEY not set — skipping daily email report")
         return False
 
     html = build_report_html(snapshot)
@@ -271,37 +270,28 @@ def send_daily_report(snapshot: Dict[str, Any]) -> bool:
     arrow = "📈" if net >= 0 else "📉"
     subject = f"{arrow} TradeBot {today_str}: ${net:+.2f} ({pnl['total_pct']:+.1f}%)"
 
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = sender
-    msg["To"] = recipient
-
-    # Plain text fallback
     plain = f"TradeBot Daily Report — {today_str}\nNet Unrealized P&L: ${net:+.2f} ({pnl['total_pct']:+.1f}%)\nView dashboard: https://tradebot-production-fdac.up.railway.app/"
-    msg.attach(MIMEText(plain, "plain"))
-    msg.attach(MIMEText(html, "html"))
 
-    # Try SSL (465) first (more reliable on cloud platforms), then STARTTLS (587)
-    errors = []
-    for method, port in [("ssl", 465), ("starttls", 587)]:
-        try:
-            log.info(f"Attempting email via {method}:{port} to {recipient}...")
-            if method == "ssl":
-                with smtplib.SMTP_SSL("smtp.gmail.com", port, timeout=10) as server:
-                    server.login(sender, password)
-                    server.send_message(msg)
-            else:
-                with smtplib.SMTP("smtp.gmail.com", port, timeout=10) as server:
-                    server.starttls()
-                    server.login(sender, password)
-                    server.send_message(msg)
-            log.info(f"Daily report emailed to {recipient} via {method}:{port}")
+    try:
+        log.info(f"Sending report via Resend API to {recipient}...")
+        resp = http_requests.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "from": sender,
+                "to": [recipient],
+                "subject": subject,
+                "html": html,
+                "text": plain,
+            },
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            log.info(f"Daily report emailed to {recipient} via Resend (id={resp.json().get('id')})")
             return True
-        except Exception as e:
-            err_msg = f"{method}:{port} — {type(e).__name__}: {e}"
-            log.warning(f"Email send failed: {err_msg}")
-            errors.append(err_msg)
-            continue
-
-    log.error(f"Failed to send daily report — all methods failed: {errors}")
-    return False
+        else:
+            log.error(f"Resend API error {resp.status_code}: {resp.text}")
+            return False
+    except Exception as e:
+        log.error(f"Failed to send daily report via Resend: {type(e).__name__}: {e}")
+        return False
