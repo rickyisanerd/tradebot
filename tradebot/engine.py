@@ -881,6 +881,8 @@ class TradingEngine:
             return []
         positions = self.broker.positions()
         existing = {p.symbol for p in positions}
+        # Rebuy cooldown: don't re-buy stocks we recently sold at a loss
+        recently_sold = self.db.recently_sold_symbols(self.settings.rebuy_cooldown_hours)
         account = self.broker.account()
         bought: List[dict] = []
         open_position_limit = self.settings.max_open_positions or (len(positions) + self.settings.max_new_positions_per_run)
@@ -903,6 +905,16 @@ class TradingEngine:
                 break
             if candidate.action != "buy" or candidate.symbol in existing:
                 continue
+            # Skip stocks we recently sold at a loss — avoid buy/sell loops
+            sold_info = recently_sold.get(candidate.symbol)
+            if sold_info:
+                sold_pnl = sold_info.get("pnl_pct") or 0
+                if sold_pnl < 0:
+                    log.info(
+                        "Skipping %s — sold at %.1f%% within %dh cooldown",
+                        candidate.symbol, sold_pnl, self.settings.rebuy_cooldown_hours,
+                    )
+                    continue
             max_affordable_qty = int(min(cash_left, capital_left) / candidate.price) if candidate.price > 0 else 0
             qty = min(candidate.qty, max_affordable_qty)
             est_cost = qty * candidate.price

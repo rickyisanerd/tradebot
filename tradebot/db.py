@@ -552,6 +552,34 @@ class Database:
                 (utc_now(), symbol, side, qty, price, status, note, pnl_pct, json.dumps(analysis or {})),
             )
 
+    def recently_sold_symbols(self, hours: int = 48) -> Dict[str, Dict[str, Any]]:
+        """Return symbols sold within the last N hours, with their sell details.
+
+        Returns a dict of {symbol: {"sold_at": str, "pnl_pct": float, "note": str}}
+        so callers can decide whether to rebuy based on context.
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        with self.connect() as con:
+            rows = con.execute(
+                """
+                SELECT symbol, created_at, pnl_pct, note
+                FROM trade_events
+                WHERE side = 'sell' AND created_at >= ?
+                ORDER BY created_at DESC
+                """,
+                (cutoff,),
+            ).fetchall()
+        result: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            sym = row["symbol"]
+            if sym not in result:
+                result[sym] = {
+                    "sold_at": row["created_at"],
+                    "pnl_pct": row["pnl_pct"],
+                    "note": row["note"],
+                }
+        return result
+
     def recover_analysis_for_symbol(self, symbol: str) -> Dict[str, float]:
         """Try to find analyst_scores from a previous buy trade event for this symbol."""
         with self.connect() as con:
