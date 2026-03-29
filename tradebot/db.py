@@ -155,6 +155,8 @@ class Database:
                 con.execute("ALTER TABLE signal_status ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0")
             if "next_retry_at" not in signal_columns:
                 con.execute("ALTER TABLE signal_status ADD COLUMN next_retry_at TEXT")
+            if "partial_profit_taken" not in columns:
+                con.execute("ALTER TABLE position_meta ADD COLUMN partial_profit_taken INTEGER NOT NULL DEFAULT 0")
             for strategy in ("decision_support", "momentum", "reversion", "risk"):
                 con.execute(
                     """
@@ -649,6 +651,20 @@ class Database:
             con.execute(
                 "UPDATE position_meta SET stop_price = ? WHERE symbol = ?",
                 (round(stop_price, 2), symbol),
+            )
+
+    def mark_partial_profit_taken(self, symbol: str) -> None:
+        with self.connect() as con:
+            con.execute(
+                "UPDATE position_meta SET partial_profit_taken = 1 WHERE symbol = ?",
+                (symbol,),
+            )
+
+    def update_position_qty(self, symbol: str, new_qty: float) -> None:
+        with self.connect() as con:
+            con.execute(
+                "UPDATE position_meta SET qty = ? WHERE symbol = ?",
+                (new_qty, symbol),
             )
 
     def set_exit_pending(self, symbol: str, pending: bool) -> None:

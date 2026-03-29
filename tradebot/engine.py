@@ -810,9 +810,50 @@ class TradingEngine:
             if bool(meta.get("exit_pending")):
                 continue
             current = prices.get(position.symbol, position.current_price)
+            entry_price = float(meta["entry_price"])
+            gain_pct = ((current - entry_price) / entry_price) if entry_price else 0.0
+
+            held_days = self._held_days(str(meta["opened_at"]))
+
+            # --- Partial profit-taking ---
+            if (
+                self.settings.partial_profit_enabled
+                and not bool(meta.get("partial_profit_taken"))
+                and held_days >= self.settings.min_hold_days
+                and gain_pct >= self.settings.partial_profit_pct
+                and position.qty >= 2
+            ):
+                sell_qty = max(1, int(position.qty * self.settings.partial_sell_fraction))
+                remaining_qty = position.qty - sell_qty
+                try:
+                    if self.settings.is_alpaca and self.settings.use_broker_protective_orders:
+                        self.broker.cancel_open_orders_for_symbol(position.symbol)
+                    result = self.broker.sell(position.symbol, sell_qty)
+                except ProviderError as exc:
+                    log.warning("Partial profit sell failed for %s: %s", position.symbol, exc)
+                else:
+                    raw_price = result.get("filled_avg_price")
+                    recorded_price = float(raw_price) if raw_price not in (None, "") else float(current)
+                    pnl_pct = ((recorded_price - entry_price) / entry_price) * 100
+                    self.db.record_trade(
+                        position.symbol, "sell", sell_qty, recorded_price,
+                        "filled", f"partial profit at +{gain_pct*100:.0f}%", pnl_pct,
+                        meta.get("analysis", {}),
+                    )
+                    self.db.mark_partial_profit_taken(position.symbol)
+                    self.db.update_position_qty(position.symbol, remaining_qty)
+                    # Ratchet stop up to breakeven so the remaining shares are house money
+                    if entry_price > float(meta["stop_price"]):
+                        self.db.update_stop_price(position.symbol, entry_price)
+                    log.info(
+                        "Partial profit: sold %d of %s at $%.2f (+%.1f%%), %d shares remain at breakeven stop",
+                        sell_qty, position.symbol, recorded_price, pnl_pct, remaining_qty,
+                    )
+                    sold.append({"symbol": position.symbol, "pnl_pct": round(pnl_pct, 2), "note": f"partial profit ({sell_qty} shares)"})
+                continue  # skip full-sell check this cycle, re-evaluate next cycle
+
             should_sell = False
             note = ""
-            held_days = self._held_days(str(meta["opened_at"]))
             effective_stop_price = self._loss_stop_price(float(meta["entry_price"]), float(meta["stop_price"]))
             # Trailing stop: ratchet the stop up as the stock moves higher
             trail_pct = max(self.settings.stop_loss_pct, 0.08)
