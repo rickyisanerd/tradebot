@@ -88,6 +88,8 @@ class Settings:
     polygon_api_key: str = field(default_factory=lambda: os.getenv("POLYGON_API_KEY", "").strip())
     short_volume_signal_enabled: bool = field(default_factory=lambda: _env_bool("SHORT_VOLUME_SIGNAL_ENABLED", True))
     decision_support_short_volume_weight: float = field(default_factory=lambda: float(os.getenv("DECISION_SUPPORT_SHORT_VOLUME_WEIGHT", "1.0")))
+    inverse_etfs_enabled: bool = field(default_factory=lambda: _env_bool("INVERSE_ETFS_ENABLED", True))
+    inverse_etfs: List[str] = field(init=False)
     demo_seed: int = field(default_factory=lambda: int(os.getenv("DEMO_SEED", "42")))
     data_dir: Path = field(default_factory=lambda: Path(os.getenv("DATA_DIR", Path.cwd() / "data")))
     db_path: Path = field(init=False)
@@ -103,6 +105,10 @@ class Settings:
         else:
             self.scan_universe = []
         self.congress_report_urls = [x.strip() for x in raw_congress_urls.split(",") if x.strip()]
+        # Inverse ETFs: bet against the market when it trends down.
+        # Default set covers major indices at various price points.
+        raw_inverse = os.getenv("INVERSE_ETFS", "SPXS,SQQQ,SDOW,SH,PSQ,DOG,SPXU,TECS")
+        self.inverse_etfs = [x.strip().upper() for x in raw_inverse.split(",") if x.strip()]
         self.data_dir = Path(self.data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.data_dir / "tradebot.db"

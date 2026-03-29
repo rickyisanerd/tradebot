@@ -440,20 +440,43 @@ class TradingEngine:
         log.info("Polygon discovered %d sub-$10 stocks (using top %d)", len(items), len(symbols))
         return symbols
 
+    def _is_inverse_etf(self, symbol: str) -> bool:
+        """Check if a symbol is in the inverse ETF list."""
+        return (
+            self.settings.inverse_etfs_enabled
+            and symbol.upper() in self.settings.inverse_etfs
+        )
+
     def _candidate_symbol_pool(self) -> List[str]:
         # If user specified a custom universe, honour it.
         if self.settings.scan_universe:
-            return self.settings.scan_universe[: self.settings.scan_limit]
+            base = self.settings.scan_universe[: self.settings.scan_limit]
+            # Always inject inverse ETFs so the bot can hedge
+            if self.settings.inverse_etfs_enabled:
+                for etf in self.settings.inverse_etfs:
+                    if etf not in base:
+                        base.append(etf)
+            return base
 
         # Try Polygon first — one API call covers the entire market.
         polygon_symbols = self._polygon_universe()
         if polygon_symbols:
+            # Inject inverse ETFs (they may be above max_stock_price)
+            if self.settings.inverse_etfs_enabled:
+                for etf in self.settings.inverse_etfs:
+                    if etf not in polygon_symbols:
+                        polygon_symbols.append(etf)
             return polygon_symbols
 
         # Non-Alpaca (demo) mode without Polygon — use hardcoded universe.
         raw_symbols = self.broker.universe()
         if not self.settings.is_alpaca:
-            return raw_symbols[: self.settings.scan_limit]
+            base = raw_symbols[: self.settings.scan_limit]
+            if self.settings.inverse_etfs_enabled:
+                for etf in self.settings.inverse_etfs:
+                    if etf not in base:
+                        base.append(etf)
+            return base
 
         # Fallback: scan Alpaca universe in batches.
         target_pool = max(self.settings.scan_limit * 4, self.settings.candidate_limit * 8)
@@ -479,8 +502,10 @@ class TradingEngine:
                 if len(item) < 20:
                     continue
                 price = float(item[-1]["c"])
-                if not (self.settings.min_stock_price <= price <= self.settings.max_stock_price):
-                    continue
+                # Inverse ETFs are exempt from the price range filter
+                if not self._is_inverse_etf(symbol):
+                    if not (self.settings.min_stock_price <= price <= self.settings.max_stock_price):
+                        continue
                 avg_dollar_volume = self._avg_dollar_volume_from_bars(item)
                 if avg_dollar_volume < baseline_liquidity:
                     continue
@@ -491,16 +516,25 @@ class TradingEngine:
 
         if ranked:
             ranked.sort(key=lambda item: item[0], reverse=True)
-            return [symbol for _, symbol in ranked[:target_pool]]
-        return raw_symbols[: self.settings.scan_limit]
+            pool = [symbol for _, symbol in ranked[:target_pool]]
+        else:
+            pool = raw_symbols[: self.settings.scan_limit]
+        # Always inject inverse ETFs into the Alpaca fallback pool
+        if self.settings.inverse_etfs_enabled:
+            for etf in self.settings.inverse_etfs:
+                if etf not in pool:
+                    pool.append(etf)
+        return pool
 
     def _candidate_from_bars(self, symbol: str, bars: List[dict], buying_power: float) -> Candidate | None:
         if len(bars) < 30:
             return None
         metrics = compute_metrics(bars)
         price = metrics["latest"]
-        if not (self.settings.min_stock_price <= price <= self.settings.max_stock_price):
-            return None
+        # Inverse ETFs are exempt from the price range filter
+        if not self._is_inverse_etf(symbol):
+            if not (self.settings.min_stock_price <= price <= self.settings.max_stock_price):
+                return None
 
         stop_from_atr = price - (metrics["atr"] * 1.6)
         stop_from_pct = price * (1 - self.settings.stop_loss_pct)
@@ -1005,4 +1039,6 @@ class TradingEngine:
             "provider": self.broker.name,
             "polygon_enabled": self.polygon is not None,
             "market_closed": self._market_is_closed(),
+            "inverse_etfs_enabled": self.settings.inverse_etfs_enabled,
+            "inverse_etfs": self.settings.inverse_etfs,
         }
