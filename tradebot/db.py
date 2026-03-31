@@ -157,6 +157,8 @@ class Database:
                 con.execute("ALTER TABLE signal_status ADD COLUMN next_retry_at TEXT")
             if "partial_profit_taken" not in columns:
                 con.execute("ALTER TABLE position_meta ADD COLUMN partial_profit_taken INTEGER NOT NULL DEFAULT 0")
+            if "peak_price" not in columns:
+                con.execute("ALTER TABLE position_meta ADD COLUMN peak_price REAL NOT NULL DEFAULT 0")
             for strategy in ("decision_support", "momentum", "reversion", "risk"):
                 con.execute(
                     """
@@ -658,6 +660,13 @@ class Database:
             con.execute(
                 "UPDATE position_meta SET partial_profit_taken = 1 WHERE symbol = ?",
                 (symbol,),
+            )
+
+    def update_peak_price(self, symbol: str, peak_price: float) -> None:
+        with self.connect() as con:
+            con.execute(
+                "UPDATE position_meta SET peak_price = ? WHERE symbol = ?",
+                (round(peak_price, 4), symbol),
             )
 
     def update_position_qty(self, symbol: str, new_qty: float) -> None:

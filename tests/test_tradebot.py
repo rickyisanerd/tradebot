@@ -1784,7 +1784,7 @@ def test_manage_positions_enforces_percent_loss_cap_when_stored_stop_is_looser(t
 
     assert sold
     assert sold[0]["symbol"] == "AAPL"
-    assert sold[0]["note"] in {"stop hit", "loss cap"}
+    assert "trailing stop" in sold[0]["note"] or sold[0]["note"] in {"stop hit", "loss cap"}
     assert broker.cancel_calls == ["AAPL"]
 
 
