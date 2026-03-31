@@ -854,28 +854,29 @@ class TradingEngine:
 
             should_sell = False
             note = ""
-            effective_stop_price = self._loss_stop_price(float(meta["entry_price"]), float(meta["stop_price"]))
-            # Trailing stop: ratchet the stop up as the stock moves higher
+            # Track peak price — the highest the stock has reached since we bought
+            peak_price = float(meta.get("peak_price") or entry_price)
+            if current > peak_price:
+                peak_price = current
+                self.db.update_peak_price(position.symbol, peak_price)
+            # Trailing stop: 10% drop from peak price, never moves down
             trail_pct = max(self.settings.stop_loss_pct, 0.08)
-            trailing_stop = current * (1 - trail_pct)
+            trailing_stop = round(peak_price * (1 - trail_pct), 2)
+            # Also respect the original stop (for initial downside protection)
+            effective_stop_price = self._loss_stop_price(entry_price, float(meta["stop_price"]))
             if trailing_stop > effective_stop_price:
                 effective_stop_price = trailing_stop
                 self.db.update_stop_price(position.symbol, trailing_stop)
             if current <= effective_stop_price:
                 should_sell = True
-                note = "stop hit"
+                drop_from_peak = ((peak_price - current) / peak_price * 100) if peak_price else 0
+                note = f"trailing stop (peak ${peak_price:.2f}, dropped {drop_from_peak:.1f}%)"
             elif self.settings.max_hold_days > 0 and held_days >= self.settings.max_hold_days:
                 should_sell = True
                 note = "time stop"
             elif position.unrealized_pl_pct <= -(self.settings.stop_loss_pct * 100):
                 should_sell = True
                 note = "loss cap"
-            elif position.unrealized_pl_pct <= -6:
-                should_sell = True
-                note = "drawdown cap"
-            elif held_days >= self.settings.min_hold_days and current >= float(meta["target_price"]):
-                should_sell = True
-                note = "target hit"
             if should_sell:
                 try:
                     if self.settings.is_alpaca and self.settings.use_broker_protective_orders:
