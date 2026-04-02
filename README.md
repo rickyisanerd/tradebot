@@ -1,117 +1,265 @@
 # TradeBot MCP
 
-A small Python trading bot project that is built to work out of the box in **demo mode**, and then switch to **Alpaca paper** or **Alpaca live** by changing environment variables.
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new)
+
+A Python stock trading bot that scans low-priced equities, scores them with multiple analyzers, and learns from its own wins and losses over time. Works out of the box in **demo mode** -- no API keys required -- and switches to **Alpaca paper** or **Alpaca live** trading by changing environment variables.
+
+---
 
 ## What it does
 
-- scans a low-priced stock universe and filters for names under your price cap
-- scores each symbol with three local MCP analyzers (embedded by default, or subprocess servers if `ANALYZER_MODE=subprocess`):
-  - momentum
-  - reversion / pullback
-  - risk
-- tracks what wins and loses in SQLite and adjusts analyzer weights over time
-- stores scan history, trades, open position metadata, and learning weights
-- can cache recent congressional PTR trades from official report PDFs and filter them under your price cap
-- can cache recent SEC filing signals for the active scan universe using the official SEC submissions feed
-- provides a FastAPI dashboard showing:
-  - current picks
-  - recent congressional buys and sells under your congress price cap
-  - open positions
-  - recent buys and sells
-  - learning weights
+- Scans a low-priced stock universe and filters for names under your price cap
+- Scores each symbol with three local MCP analyzers (embedded by default, or subprocess servers if `ANALYZER_MODE=subprocess`):
+  - **Momentum** -- trend strength and breakout detection
+  - **Reversion / Pullback** -- mean-reversion setups
+  - **Risk** -- volatility and downside guard
+- A fourth **Decision Support** analyzer folds in external signals: congressional trades, SEC filings, earnings dates, macro events, and short-volume data
+- Tracks wins and losses in SQLite and adjusts analyzer weights over time
+- Caches congressional PTR trades, SEC filings, earnings calendars, and CPI/FOMC dates
+- Provides a FastAPI dashboard showing picks, positions, trades, signal health, and learning weights
+- Supports inverse ETF hedging when the market trends down
+- Peak-based trailing stop with optional partial profit-taking
 
-## Modes
-
-### 1) Demo mode (default)
-No API keys required. Uses a deterministic market simulator so you can run and test the full product immediately.
-
-### 2) Alpaca paper mode
-Set:
-
-```env
-BROKER_MODE=paper
-ALPACA_KEY_ID=...
-ALPACA_SECRET_KEY=...
-STOP_LOSS=5
-USE_BROKER_PROTECTIVE_ORDERS=true
-MIN_HOLD_DAYS=1
-MAX_TOTAL_CAPITAL=5000
-MAX_OPEN_POSITIONS=5
-```
-
-### 3) Alpaca live mode
-Set:
-
-```env
-BROKER_MODE=live
-ALPACA_KEY_ID=...
-ALPACA_SECRET_KEY=...
-STOP_LOSS=5
-USE_BROKER_PROTECTIVE_ORDERS=true
-MIN_HOLD_DAYS=1
-MAX_TOTAL_CAPITAL=5000
-MAX_OPEN_POSITIONS=5
-```
+---
 
 ## Quick start
 
-Copy `.env.example` to `.env` and edit your local values there. Keep `.env` out of Git; commit only template changes to `.env.example`.
+### 1. Clone and set up
 
-### Linux / macOS
+```bash
+git clone https://github.com/YOUR_USER/tradebot-main.git
+cd tradebot-main
+cp .env.example .env   # edit .env with your values
+```
+
+#### Linux / macOS
 
 ```bash
 ./create_venv.sh
 source .venv/bin/activate
-python run_tests.py
-python -m tradebot.cli scan
-python -m tradebot.cli trade-once
-python -m tradebot.cli refresh-signals
-python -m tradebot.cli refresh-sec
-python -m tradebot.cli refresh-earnings
-python -m tradebot.cli refresh-macro
-python -m tradebot.cli dashboard
 ```
 
-### Windows
+#### Windows
 
 ```bat
 create_venv.bat
 .venv\Scripts\activate
-python run_tests.py
-python -m tradebot.cli scan
-python -m tradebot.cli trade-once
-python -m tradebot.cli refresh-signals
-python -m tradebot.cli refresh-sec
-python -m tradebot.cli refresh-earnings
-python -m tradebot.cli refresh-macro
-python -m tradebot.cli dashboard
 ```
 
-Open:
+### 2. Run in demo mode (no API keys needed)
 
-```text
-http://127.0.0.1:8008
+```bash
+python -m tradebot.cli scan            # see scored candidates
+python -m tradebot.cli trade-once      # advance one step, buy/sell
+python -m tradebot.cli dashboard       # web UI at http://127.0.0.1:8008
 ```
 
-## Railway deploy
+### 3. Refresh external signals
 
-This repo now includes [Procfile](c:/Users/ricky/OneDrive/Documents/tradebot_mcp_bot/tradebot_mcp_bot/Procfile) and [railway.json](c:/Users/ricky/OneDrive/Documents/tradebot_mcp_bot/tradebot_mcp_bot/railway.json) so Railway can deploy it directly from GitHub.
+```bash
+python -m tradebot.cli refresh-signals    # refresh all sources at once
+python -m tradebot.cli refresh-congress   # congressional PTR trades
+python -m tradebot.cli refresh-sec        # SEC filings
+python -m tradebot.cli refresh-earnings   # earnings calendar
+python -m tradebot.cli refresh-macro      # CPI and FOMC dates
+```
 
-Recommended Railway setup:
+### 4. Export and import learning weights (brain)
 
-- start command: `python -m uvicorn main:app --host 0.0.0.0 --port $PORT`
-- health check path: `/health`
-- public port: Railway injects `PORT` automatically, and the app now uses it by default
-- if you want SQLite state to survive redeploys, mount a Railway volume and set `DATA_DIR=/data` (or your chosen mounted path)
+Back up your bot's learned analyzer weights to a JSON file and restore them later or on another instance:
 
-If you do not mount a volume, local files like the SQLite database and demo broker state will be ephemeral on Railway.
+```bash
+python -m tradebot.cli export-brain              # writes brain.json
+python -m tradebot.cli export-brain --out my.json # custom filename
+python -m tradebot.cli import-brain              # reads brain.json
+python -m tradebot.cli import-brain --file my.json
+```
 
-Recommended Railway operating model:
+The exported JSON looks like:
 
-- Run exactly one instance. This app uses SQLite plus in-process scheduling, so it is not designed for multiple replicas.
-- Mount a persistent volume and set `DATA_DIR=/data`.
-- Start with `AUTO_TRADE_ENABLED=false` and use the dashboard or `trade-once` manually first.
-- Keep live risk tight: `MAX_TOTAL_CAPITAL=1000`, `MAX_OPEN_POSITIONS=1`, `MAX_NEW_POSITIONS_PER_RUN=1`, `RISK_PER_TRADE_PCT=0.005`, `MAX_POSITION_PCT=0.10`, `STOP_LOSS_PCT=0.05`.
+```json
+{
+  "exported_at": "2026-03-31T12:00:00+00:00",
+  "learning": {
+    "decision_support": { "wins": 5, "losses": 2, "total_return": 0.35, "weight": 1.42 },
+    "momentum":         { "wins": 3, "losses": 1, "total_return": 0.20, "weight": 1.25 },
+    "reversion":        { "wins": 2, "losses": 3, "total_return": -0.10, "weight": 0.85 },
+    "risk":             { "wins": 4, "losses": 0, "total_return": 0.15, "weight": 1.30 }
+  }
+}
+```
+
+This is useful when redeploying on Railway (ephemeral filesystem) or sharing a trained brain between environments.
+
+---
+
+## Broker modes
+
+| Mode | Env var | API keys needed? | Description |
+|------|---------|------------------|-------------|
+| Demo | `BROKER_MODE=demo` (default) | No | Deterministic market simulator |
+| Paper | `BROKER_MODE=paper` | Yes | Alpaca paper trading |
+| Live | `BROKER_MODE=live` | Yes | Alpaca live trading (real money) |
+
+---
+
+## Environment variables
+
+All settings live in `tradebot/config.py`. Copy `.env.example` to `.env` and edit your values there. Keep `.env` out of Git.
+
+### Core
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BROKER_MODE` | `demo` | `demo`, `paper`, or `live` |
+| `ALPACA_KEY_ID` | _(empty)_ | Alpaca API key (required for paper/live) |
+| `ALPACA_SECRET_KEY` | _(empty)_ | Alpaca secret key (required for paper/live) |
+| `DATA_DIR` | `./data` | Directory for SQLite DB and demo state |
+| `AUTO_TRADE_ENABLED` | `true` | Enable auto-trade loop on dashboard start |
+| `AUTO_TRADE_INTERVAL_MINUTES` | `30` | Minutes between auto-trade cycles |
+| `STARTING_CASH` | `100000` | Demo mode starting cash |
+| `DEMO_SEED` | `42` | Seed for deterministic demo market |
+
+### Risk and position sizing
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MAX_TOTAL_CAPITAL` | `500` | Max capital deployed across all positions |
+| `MAX_OPEN_POSITIONS` | `5` | Max simultaneous open positions |
+| `MAX_NEW_POSITIONS_PER_RUN` | `3` | Max new buys per trade cycle |
+| `RISK_PER_TRADE_PCT` | `0.04` | Fraction of capital risked per trade |
+| `MAX_POSITION_PCT` | `0.25` | Max fraction of capital in one position |
+| `STOP_LOSS_PCT` | `0.12` | Stop-loss distance (also accepts `STOP_LOSS`) |
+| `MIN_REWARD_RISK` | `1.2` | Minimum reward-to-risk ratio |
+| `USE_BROKER_PROTECTIVE_ORDERS` | `true` | Submit bracket orders to Alpaca |
+| `MIN_HOLD_DAYS` | `0` | Minimum days before target exit fires |
+| `MAX_HOLD_DAYS` | `0` | Time-stop in days (0 = disabled) |
+| `PDT_COOLDOWN_HOURS` | `20` | Pattern day trade cooldown |
+| `REBUY_COOLDOWN_HOURS` | `48` | Hours before re-buying a recently sold symbol |
+
+### Partial profit and trailing stop
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PARTIAL_PROFIT_ENABLED` | `true` | Sell half at the partial-profit threshold |
+| `PARTIAL_PROFIT_PCT` | `15` | Percent gain to trigger partial sell |
+| `PARTIAL_SELL_FRACTION` | `0.5` | Fraction of position to sell at partial profit |
+
+### Scanning
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MAX_STOCK_PRICE` | `10` | Max price for scan universe |
+| `MIN_STOCK_PRICE` | `2` | Min price for scan universe |
+| `SCAN_LIMIT` | `200` | Max symbols to scan per cycle |
+| `CANDIDATE_LIMIT` | `30` | Max candidates to score |
+| `MIN_DOLLAR_VOLUME` | `1000000` | Min daily dollar volume filter |
+| `LOOKBACK_DAYS` | `80` | Days of price history for analyzers |
+| `SCAN_UNIVERSE` | _(empty)_ | Comma-separated override list of symbols |
+
+### Inverse ETF hedging
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `INVERSE_ETFS_ENABLED` | `true` | Enable inverse ETF hedging |
+| `INVERSE_ETFS` | `SPXS,SQQQ,SDOW,SH,PSQ,DOG,SPXU,TECS` | Inverse ETF tickers |
+
+### Congress trades
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CONGRESS_REPORT_URLS` | _(empty)_ | Comma-separated official PTR PDF URLs |
+| `CONGRESS_MAX_PRICE` | value of `MAX_STOCK_PRICE` | Max price for congress trade filter |
+| `CONGRESS_TRADE_LIMIT` | `20` | Max congress trades to display |
+| `CONGRESS_SIGNAL_WINDOW_DAYS` | `45` | Lookback window for congress signal |
+| `CONGRESS_FRESHNESS_HOURS` | `24` | Max age before source is stale |
+| `CONGRESS_MIN_RECORDS` | `1` | Min cached records to trust source |
+| `CONGRESS_RETRY_MINUTES` | `15` | Backoff after failure |
+| `CONGRESS_OVERRIDE_MODE` | `auto` | `auto`, `disabled`, `ignore-backoff`, or `trusted` |
+| `DECISION_SUPPORT_CONGRESS_WEIGHT` | `1.0` | Weight of congress signal in scoring |
+
+### SEC filings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SEC_USER_AGENT` | _(empty)_ | Contact string for SEC API (required) |
+| `SEC_SIGNAL_WINDOW_DAYS` | `30` | Lookback window for SEC signal |
+| `SEC_FILING_LIMIT_PER_SYMBOL` | `20` | Max filings cached per symbol |
+| `SEC_FRESHNESS_HOURS` | `24` | Max age before source is stale |
+| `SEC_MIN_RECORDS` | `1` | Min cached records to trust source |
+| `SEC_RETRY_MINUTES` | `15` | Backoff after failure |
+| `SEC_OVERRIDE_MODE` | `auto` | `auto`, `disabled`, `ignore-backoff`, or `trusted` |
+| `DECISION_SUPPORT_SEC_WEIGHT` | `1.0` | Weight of SEC signal in scoring |
+
+### Earnings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ALPHA_VANTAGE_API_KEY` | _(empty)_ | Alpha Vantage key for earnings calendar |
+| `EARNINGS_SIGNAL_WINDOW_DAYS` | `21` | Forward window for upcoming earnings |
+| `EARNINGS_FRESHNESS_HOURS` | `24` | Max age before source is stale |
+| `EARNINGS_MIN_RECORDS` | `1` | Min cached records to trust source |
+| `EARNINGS_RETRY_MINUTES` | `15` | Backoff after failure |
+| `EARNINGS_OVERRIDE_MODE` | `auto` | `auto`, `disabled`, `ignore-backoff`, or `trusted` |
+| `DECISION_SUPPORT_EARNINGS_WEIGHT` | `1.0` | Weight of earnings signal in scoring |
+
+### Macro events
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MACRO_SIGNAL_WINDOW_DAYS` | `7` | Forward window for CPI/FOMC events |
+| `MACRO_FRESHNESS_HOURS` | `24` | Max age before source is stale |
+| `MACRO_MIN_RECORDS` | `1` | Min cached records to trust source |
+| `MACRO_RETRY_MINUTES` | `15` | Backoff after failure |
+| `MACRO_OVERRIDE_MODE` | `auto` | `auto`, `disabled`, `ignore-backoff`, or `trusted` |
+| `DECISION_SUPPORT_MACRO_WEIGHT` | `1.0` | Weight of macro signal in scoring |
+
+### Short volume
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `POLYGON_API_KEY` | _(empty)_ | Polygon.io key for short-volume data |
+| `SHORT_VOLUME_SIGNAL_ENABLED` | `true` | Enable short-volume signal |
+| `DECISION_SUPPORT_SHORT_VOLUME_WEIGHT` | `1.0` | Weight of short-volume signal |
+
+### Dashboard
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DASHBOARD_HOST` | `0.0.0.0` | Dashboard bind address |
+| `PORT` / `DASHBOARD_PORT` | `8008` | Dashboard port (Railway injects `PORT`) |
+| `ANALYZER_MODE` | `embedded` | `embedded` or `subprocess` |
+
+---
+
+## Deploy to Railway
+
+### Option A: One-click from GitHub
+
+1. Push this repo to a GitHub repository
+2. Go to [railway.com/new](https://railway.com/new) and select **Deploy from GitHub repo**
+3. Pick your repo -- Railway detects `railway.json` automatically
+4. Add environment variables in the Railway dashboard (see table above)
+5. (Recommended) Attach a **Volume** mounted at `/data` and set `DATA_DIR=/data` so the SQLite database survives redeploys
+
+### Option B: Railway CLI
+
+```bash
+npm i -g @railway/cli
+railway login
+railway init
+railway up
+```
+
+Then set your env vars with `railway variables set KEY=VALUE`.
+
+### Railway tips
+
+- Run exactly **one instance**. SQLite plus in-process scheduling is not designed for multiple replicas.
+- Mount a persistent volume at `/data` and set `DATA_DIR=/data`.
+- Start with `AUTO_TRADE_ENABLED=false` and use `trade-once` manually first.
+- Keep live risk tight: `MAX_TOTAL_CAPITAL=1000`, `MAX_OPEN_POSITIONS=1`, `MAX_NEW_POSITIONS_PER_RUN=1`.
+- Export your brain before redeploying: `python -m tradebot.cli export-brain`, then import after.
 
 ### Railway paper profile
 
@@ -155,94 +303,67 @@ SEC_USER_AGENT=TradeBot MCP your-email@example.com
 ALPHA_VANTAGE_API_KEY=your_alpha_vantage_key
 ```
 
-## Environment variables
+---
 
-The app reads its active settings from `tradebot/config.py`. Use `.env.example` as the shareable template and `.env` for machine-local secrets such as Alpaca credentials.
-
-If you add a new key to `.env`, it will only affect runtime after the setting is also wired into `tradebot/config.py` and the code that uses it.
-
-`STOP_LOSS` (or `STOP_LOSS_PCT`) now controls the stop distance used when the bot computes exits. In Alpaca paper/live mode, `USE_BROKER_PROTECTIVE_ORDERS=true` submits bracket entry orders so Alpaca can hold the stop-loss and take-profit legs at the broker.
-
-`MIN_HOLD_DAYS` prevents routine target exits from firing too early, while `MAX_HOLD_DAYS` can enforce a time stop when set above `0`. `MAX_TOTAL_CAPITAL` and `MAX_OPEN_POSITIONS` cap how much exposure the bot is allowed to carry across the portfolio.
-
-`CONGRESS_REPORT_URLS` accepts a comma-separated list of official House or Senate PTR PDF URLs. Run `python -m tradebot.cli refresh-congress` or click `Refresh Congress` in the dashboard to cache those trades locally, price them through the active broker feed, and show only names trading at or below `CONGRESS_MAX_PRICE`.
-
-`SEC_USER_AGENT` should be set to a descriptive contact string before using `python -m tradebot.cli refresh-sec`. The bot uses the official SEC submissions feed to cache recent forms such as `4`, `8-K`, `10-Q`, `10-K`, and common offering-related forms, then folds those cached signals into the decision-support analyzer.
-
-`ALPHA_VANTAGE_API_KEY` enables `python -m tradebot.cli refresh-earnings`, which caches near-term earnings dates from the Alpha Vantage earnings calendar so the decision-support analyzer can penalize setups that are about to run into earnings gap risk.
-
-`python -m tradebot.cli refresh-macro` caches upcoming CPI and FOMC dates from official BLS and Federal Reserve calendar pages so the decision-support analyzer can treat market-wide event risk as a first-class input.
-
-`python -m tradebot.cli trade-once` now trades strictly from cached signal data. Use `python -m tradebot.cli refresh-signals` first when you want to update every external feed in one pass. The dashboard also exposes source health so stale or failed feeds are visible instead of silently degrading decisions.
-
-You can tune reliability and influence with env vars such as `CONGRESS_FRESHNESS_HOURS`, `SEC_FRESHNESS_HOURS`, `EARNINGS_FRESHNESS_HOURS`, `MACRO_FRESHNESS_HOURS`, and `DECISION_SUPPORT_*_WEIGHT`.
-
-Stale, failed, disabled, or zero-weight external sources are now excluded from candidate scoring instead of being treated like fresh signals, and the dashboard shows each candidate’s per-source signal usage state.
-
-You can also require a minimum number of cached records before a source is trusted by setting `CONGRESS_MIN_RECORDS`, `SEC_MIN_RECORDS`, `EARNINGS_MIN_RECORDS`, and `MACRO_MIN_RECORDS`. Sources that are fresh but too thin are marked `low-confidence` and excluded from scoring.
-
-Each source also supports retry backoff controls with `CONGRESS_RETRY_MINUTES`, `SEC_RETRY_MINUTES`, `EARNINGS_RETRY_MINUTES`, and `MACRO_RETRY_MINUTES`. Repeated failures now enter a visible `backoff` state so the bot stops retrying the same broken feed every cycle.
-
-The dashboard now also shows a recent signal refresh history so you can see whether a source has been succeeding, failing, disabled, or sitting in backoff over time.
-
-If you need an operational escape hatch, each source also supports an override mode: `auto`, `disabled`, `ignore-backoff`, or `trusted`. Use `*_OVERRIDE_MODE` env vars carefully when debugging or working around flaky upstreams.
-
-## Running tests
-
-Use `python run_tests.py` as the supported test command.
-
-Convenience wrappers are included:
-
-```bash
-./run_tests.sh
-```
-
-```bat
-run_tests.bat
-```
-
-The repo still contains pytest-style test functions, but `pytest` itself can fail on some Windows/OneDrive setups because its temp-directory cleanup hits filesystem permission issues. `run_tests.py` runs the same test module directly and avoids that runner-specific failure mode.
-
-## Git helper script
-
-Use the included script to stage, commit, and push in one step.
-
-### Windows
-
-```bat
-push_git.bat "your commit message"
-```
-
-### Linux / macOS
-
-```bash
-./push_git.sh "your commit message"
-```
-
-Optional arguments:
-
-- second argument: branch name, defaults to the current branch
-- third argument: remote name, defaults to `origin`
-
-## Notes
-
-- `trade-once` advances the demo market one step, checks exits, scans again, and buys fresh candidates.
-- the learning loop is intentionally simple and transparent rather than pretending to be magic wizard dust.
-- this is a starter system, not financial advice, and not a promise of profits.
-
-## Project layout
+## Architecture
 
 ```text
 tradebot/
-  analytics.py
-  cli.py
-  config.py
-  dashboard.py
-  db.py
-  engine.py
-  models.py
-  providers.py
-  universe.py
-  templates/index.html
-tests/
+  cli.py              Command-line interface (scan, trade-once, export-brain, etc.)
+  config.py            Settings dataclass, reads all env vars
+  dashboard.py         FastAPI web dashboard with auto-trade scheduler
+  db.py                SQLite persistence: trades, positions, learning, signals
+  engine.py            Core trading engine: scan, score, buy, sell, exit logic
+  models.py            Pydantic models (Candidate, Position, etc.)
+  providers.py         Broker abstraction (Demo simulator, Alpaca paper/live)
+  analytics.py         Embedded MCP analyzers (momentum, reversion, risk)
+  universe.py          Stock universe builder and filtering
+  congress.py          Congressional PTR trade parser
+  sec.py               SEC EDGAR filing fetcher
+  earnings.py          Alpha Vantage earnings calendar
+  macro.py             CPI and FOMC calendar scraper
+  polygon.py           Polygon.io short-volume data
+  email_report.py      Email reporting via Resend API
+  mcp_bridge.py        Bridge for subprocess MCP analyzer servers
+  mcp_servers/         Standalone MCP analyzer server implementations
+    momentum_server.py
+    reversion_server.py
+    risk_server.py
+    decision_support_server.py
+  templates/
+    index.html         Dashboard HTML template
 ```
+
+---
+
+## Running tests
+
+```bash
+python run_tests.py
+```
+
+Convenience wrappers: `./run_tests.sh` (Linux/macOS) or `run_tests.bat` (Windows).
+
+The repo uses `run_tests.py` instead of `pytest` directly to avoid temp-directory permission issues on Windows/OneDrive setups.
+
+---
+
+## Git helper
+
+```bash
+# Windows
+push_git.bat "your commit message"
+
+# Linux / macOS
+./push_git.sh "your commit message"
+```
+
+Optional second arg for branch name, third for remote name.
+
+---
+
+## Notes
+
+- `trade-once` advances the demo market one step, checks exits, scans, and buys fresh candidates.
+- The learning loop is intentionally simple and transparent.
+- This is a starter system, not financial advice, and not a promise of profits.
