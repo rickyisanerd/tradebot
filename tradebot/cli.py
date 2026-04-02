@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime, timezone
+from pathlib import Path
 
 import uvicorn
 
@@ -18,6 +20,64 @@ def build_engine() -> TradingEngine:
     return TradingEngine(settings=settings, broker=broker, db=db)
 
 
+def export_brain(db: Database, out_path: str) -> dict:
+    """Export learning weights from the database to a JSON file."""
+    weights = db.learning_weights()
+    payload = {
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "learning": {},
+    }
+    for strategy, row in weights.items():
+        payload["learning"][strategy] = {
+            "wins": row["wins"],
+            "losses": row["losses"],
+            "total_return": row["total_return"],
+            "weight": row["weight"],
+        }
+    dest = Path(out_path)
+    dest.write_text(json.dumps(payload, indent=2))
+    return {"exported": len(payload["learning"]), "file": str(dest.resolve())}
+
+
+def import_brain(db: Database, in_path: str) -> dict:
+    """Import learning weights from a JSON file into the database."""
+    src = Path(in_path)
+    if not src.exists():
+        return {"error": f"File not found: {src}"}
+    data = json.loads(src.read_text())
+    learning = data.get("learning", {})
+    now = datetime.now(timezone.utc).isoformat()
+    imported = 0
+    with db.connect() as con:
+        for strategy, values in learning.items():
+            con.execute(
+                """
+                INSERT INTO learning(strategy, wins, losses, total_return, weight, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(strategy) DO UPDATE SET
+                    wins=excluded.wins,
+                    losses=excluded.losses,
+                    total_return=excluded.total_return,
+                    weight=excluded.weight,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    strategy,
+                    values.get("wins", 0),
+                    values.get("losses", 0),
+                    values.get("total_return", 0.0),
+                    values.get("weight", 1.0),
+                    now,
+                ),
+            )
+            imported += 1
+    return {
+        "imported": imported,
+        "source": str(src.resolve()),
+        "exported_at": data.get("exported_at", "unknown"),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="TradeBot MCP")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -30,6 +90,13 @@ def main() -> int:
     sub.add_parser("refresh-macro", help="Refresh cached CPI and FOMC calendar events")
     sub.add_parser("status", help="Print dashboard snapshot as JSON")
     sub.add_parser("dashboard", help="Run the FastAPI dashboard")
+
+    export_parser = sub.add_parser("export-brain", help="Export learning weights to a JSON file")
+    export_parser.add_argument("--out", default="brain.json", help="Output file path (default: brain.json)")
+
+    import_parser = sub.add_parser("import-brain", help="Import learning weights from a JSON file")
+    import_parser.add_argument("--file", default="brain.json", help="Input file path (default: brain.json)")
+
     args = parser.parse_args()
 
     engine = build_engine()
@@ -69,6 +136,14 @@ def main() -> int:
     if args.command == "dashboard":
         uvicorn.run("tradebot.dashboard:app", host=settings.dashboard_host, port=settings.dashboard_port, reload=False)
         return 0
+    if args.command == "export-brain":
+        result = export_brain(engine.db, args.out)
+        print(json.dumps(result, indent=2))
+        return 0
+    if args.command == "import-brain":
+        result = import_brain(engine.db, args.file)
+        print(json.dumps(result, indent=2))
+        return 1 if "error" in result else 0
     return 1
 
 
