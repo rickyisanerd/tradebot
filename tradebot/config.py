@@ -67,6 +67,7 @@ class Settings:
     macro_override_mode: str = field(default_factory=lambda: os.getenv("MACRO_OVERRIDE_MODE", "auto").strip().lower())
     decision_support_macro_weight: float = field(default_factory=lambda: float(os.getenv("DECISION_SUPPORT_MACRO_WEIGHT", "1.0")))
     stop_loss_pct: float = field(default_factory=lambda: _env_ratio("STOP_LOSS_PCT", "STOP_LOSS", default=0.12))
+    trailing_stop_pct: float = field(default_factory=lambda: _env_ratio("TRAILING_STOP_PCT", default=0.10))
     partial_profit_enabled: bool = field(default_factory=lambda: _env_bool("PARTIAL_PROFIT_ENABLED", True))
     partial_profit_pct: float = field(default_factory=lambda: float(os.getenv("PARTIAL_PROFIT_PCT", "15")) / 100.0)
     partial_sell_fraction: float = field(default_factory=lambda: float(os.getenv("PARTIAL_SELL_FRACTION", "0.5")))

@@ -859,8 +859,9 @@ class TradingEngine:
             if current > peak_price:
                 peak_price = current
                 self.db.update_peak_price(position.symbol, peak_price)
-            # Trailing stop: 10% drop from peak price, never moves down
-            trail_pct = max(self.settings.stop_loss_pct, 0.08)
+            # Trailing stop: drop from peak price (default 10%), never moves down.
+            # Uses TRAILING_STOP_PCT independently from STOP_LOSS_PCT (the loss cap).
+            trail_pct = self.settings.trailing_stop_pct
             trailing_stop = round(peak_price * (1 - trail_pct), 2)
             # Also respect the original stop (for initial downside protection)
             effective_stop_price = self._loss_stop_price(entry_price, float(meta["stop_price"]))
